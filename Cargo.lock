@@ -71,6 +71,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepfunc-cli"
+version = "0.1.0"
+dependencies = [
+ "deepfunc-core",
+]
+
+[[package]]
+name = "deepfunc-core"
+version = "0.1.0"
+dependencies = [
+ "creusot-std",
+ "iai-callgrind",
+ "no-panic",
+ "proptest",
+]
+
+[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,23 +548,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
-]
-
-[[package]]
-name = "template-core"
-version = "0.1.0"
-dependencies = [
- "creusot-std",
- "iai-callgrind",
- "no-panic",
- "proptest",
-]
-
-[[package]]
-name = "template-exec"
-version = "0.1.0"
-dependencies = [
- "template-core",
 ]
 
 [[package]]
