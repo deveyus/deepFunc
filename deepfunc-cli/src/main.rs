@@ -399,8 +399,10 @@ fn lsp_workspace(
     timeout_secs: u64,
 ) -> Result<Vec<CallerEntry>, Error> {
     let mut client = RaClient::spawn(ra_bin, root, timeout_secs)?;
-    // No upfront readiness gate here: each query below polls until the
-    // index it reads is stable, so empty answers are trustworthy.
+    // Readiness first, lookup second. The canary gate waits for a loaded
+    // index; after it passes, empty answers mean genuinely unknown and
+    // resolve fast instead of burning full retry budgets.
+    client.ensure_index_ready();
     // Resolve the target to one hierarchy item.
     let (uri, line0, character) = if let Some((path, line0)) = parse_file_line(root, target) {
         let text = read_file(&path)?;

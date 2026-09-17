@@ -84,5 +84,9 @@ Remaining:
 
 - Per-invocation RA spawn pays full workspace load each run (~30s here).
   No daemon per operator decision.
-- Unknown targets burn the 45s symbol budget before E04. Candidate: probe
-  a canary query first to separate "index loading" from "unknown name".
+- Readiness/liveness split: `ensure_index_ready` gates on canary `"a"`
+  (non-empty + stable count, 30s budget); target lookups then trust empty
+  after one 3s retry. Unknown names fail in load-time + ~3s. Hierarchy
+  empties carry a 5s backstop only. A workspace with no `a`-matching
+  function names would burn the canary budget and proceed unguarded
+  (accepted: vanishingly rare, still correct, just slower).

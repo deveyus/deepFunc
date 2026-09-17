@@ -382,55 +382,73 @@ impl RaClient {
         );
     }
 
-    /// Find function/method symbols matching `query` (rust-analyzer
-    /// `workspace/symbol`). Returns only kind Function (12) / Method (6).
-    ///
-    /// Cold-index race handling: rust-analyzer fills the symbol index
-    /// incrementally, so the first non-empty answer can still be partial.
-    /// This polls until the answer is non-empty AND stable across two
-    /// consecutive polls (count unchanged), or quiescent, or budget expiry.
-    /// An empty answer after a stable/complete index means genuinely
-    /// unknown — not a race.
-    pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
+    /// Single `workspace/symbol` round trip, filtered to kind Function (12)
+    /// / Method (6). Treats `null` as empty (rust-analyzer answers `null`
+    /// while still indexing — not a protocol error).
+    fn request_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
+        let result = self.request("workspace/symbol", json!({"query": query}))?;
+        let symbols: Vec<SymbolInfo> =
+            match serde_json::from_value::<Option<Vec<SymbolInfo>>>(result) {
+                Ok(None) => Vec::new(),
+                Ok(Some(symbols)) => symbols,
+                Err(error) => {
+                    return Err(Error::RequestFailed {
+                        request: "workspace/symbol".to_owned(),
+                        timeout_secs: self.timeout_secs,
+                        detail: "failed to decode symbols: ".to_owned() + &error.to_string(),
+                    })
+                }
+            };
+        Ok(symbols
+            .into_iter()
+            .filter(|symbol| symbol.kind == 6 || symbol.kind == 12)
+            .collect())
+    }
+
+    /// Wait until the symbol index is loaded, using a canary query that
+    /// matches in virtually every workspace. Polls until the canary answer
+    /// is non-empty AND unchanged across two polls, or 30s budget.
+    /// Returns true when the index looks ready. Call once after spawn;
+    /// after this, an empty target lookup means genuinely unknown.
+    pub fn ensure_index_ready(&mut self) -> bool {
         let start = Instant::now();
-        let budget = Duration::from_secs(45);
+        let budget = Duration::from_secs(30);
         let mut last_count: Option<usize> = None;
         loop {
-            let result = self.request("workspace/symbol", json!({"query": query}))?;
-            // rust-analyzer answers `null` while still indexing. Empty,
-            // not a protocol error — the stability loop below retries.
-            let symbols: Vec<SymbolInfo> =
-                match serde_json::from_value::<Option<Vec<SymbolInfo>>>(result) {
-                    Ok(None) => Vec::new(),
-                    Ok(Some(symbols)) => symbols,
-                    Err(error) => {
-                        return Err(Error::RequestFailed {
-                            request: "workspace/symbol".to_owned(),
-                            timeout_secs: self.timeout_secs,
-                            detail: "failed to decode symbols: ".to_owned() + &error.to_string(),
-                        })
+            match self.request_symbols("a") {
+                Ok(functions) => {
+                    if self.is_quiescent() {
+                        return true;
                     }
-                };
-            let functions: Vec<SymbolInfo> = symbols
-                .into_iter()
-                .filter(|symbol| symbol.kind == 6 || symbol.kind == 12)
-                .collect();
-            if self.is_quiescent() {
-                return Ok(functions);
-            }
-            if !functions.is_empty() && last_count == Some(functions.len()) {
-                return Ok(functions);
+                    if !functions.is_empty() && last_count == Some(functions.len()) {
+                        return true;
+                    }
+                    last_count = Some(functions.len());
+                }
+                Err(_) => return false,
             }
             if start.elapsed() >= budget {
-                return Ok(functions);
+                return self.is_quiescent();
             }
-            last_count = Some(functions.len());
             std::thread::sleep(Duration::from_secs(2));
         }
     }
 
-    /// Resolve a document position to hierarchy items. Retries an empty
-    /// result while still indexing; trusts it once quiescent.
+    /// Find function/method symbols matching `query`. Assumes
+    /// [`ensure_index_ready`](Self::ensure_index_ready) ran first: one
+    /// request, one spaced retry for reanalysis races, then trust empty.
+    pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
+        let functions = self.request_symbols(query)?;
+        if !functions.is_empty() {
+            return Ok(functions);
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        self.request_symbols(query)
+    }
+
+    /// Resolve a document position to hierarchy items. The readiness gate
+    /// runs first, so empty is trusted after a short backstop retry for
+    /// reanalysis races (e.g. a just-did_open'd file).
     pub fn prepare_hierarchy(
         &mut self,
         uri: &str,
@@ -438,7 +456,7 @@ impl RaClient {
         character: u32,
     ) -> Result<Vec<HierarchyItem>, Error> {
         let start = Instant::now();
-        let budget = Duration::from_secs(20);
+        let budget = Duration::from_secs(5);
         loop {
             let result = self.request(
                 "textDocument/prepareCallHierarchy",
@@ -466,8 +484,9 @@ impl RaClient {
         }
     }
 
-    /// Direct callers of one hierarchy item. Retries an empty result while
-    /// still indexing; trusts it once quiescent (true leaf, not a race).
+    /// Direct callers of one hierarchy item. Same backstop policy as
+    /// [`prepare_hierarchy`](Self::prepare_hierarchy): trust empty fast,
+    /// since readiness was gated upfront. True leaves cost ~5s, not 20s.
     pub fn incoming_calls(&mut self, item: &HierarchyItem) -> Result<Vec<IncomingCall>, Error> {
         let item_value = match serde_json::to_value(item) {
             Ok(value) => value,
@@ -480,7 +499,7 @@ impl RaClient {
             }
         };
         let start = Instant::now();
-        let budget = Duration::from_secs(20);
+        let budget = Duration::from_secs(5);
         loop {
             let result =
                 self.request("callHierarchy/incomingCalls", json!({"item": item_value}))?;
