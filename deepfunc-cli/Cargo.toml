@@ -1,0 +1,11 @@
+[package]
+name = "deepfunc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+deepfunc-core = { path = "../deepfunc-core" }
+
+[lints]
+workspace = true

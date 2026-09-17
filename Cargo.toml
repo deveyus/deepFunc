@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["deepfunc-core", "deepfunc-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+# No-panic discipline: our code introduces no panics (library internals may,
+# we must not add paths to them).
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

@@ -1,0 +1,20 @@
+[package]
+name = "deepfunc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+creusot-std = { git = "https://github.com/creusot-rs/creusot", rev = "2a1bc72" }
+
+[dev-dependencies]
+iai-callgrind = "0.16"
+no-panic = "0.1"
+proptest = "1"
+
+[[bench]]
+name = "core"
+harness = false
+
+[lints]
+workspace = true
