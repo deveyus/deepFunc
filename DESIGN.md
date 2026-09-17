@@ -58,8 +58,16 @@ Codes:
 - `E06` rust-analyzer request failed or timed out (include request name, timeout secs; suspected: RA still indexing — suggest retry with --timeout).
 - `E07` file read or output write failed (include path and OS error).
 
-## 6. Open items
+## 6. Open items (updated: LSP driver landed)
 
-- LSP client crate choice (lsp-server vs tower-lsp vs direct JSON-RPC).
-- Fallback to syn/ast-grep when rust-analyzer fails.
-- Signature extraction strategy (rust-analyzer hover vs syn parse).
+- `workspace/symbol` polls up to 30s for a non-empty index. Depth-2 queries
+  on a cold index can return empty (observed once: `scan_workspace` showed
+  no depth-2 while `run` correctly showed `main`). Suspected cause: RA still
+  indexing when depth-2 runs. Mitigation candidates: wait for a full index
+  signal, or retry empty depth-2 once after a delay.
+- Per-invocation RA spawn pays full workspace load each run (seconds).
+  Candidate: long-lived RA daemon or cached responses for repeated targets.
+- `file.rs:line` targets use the first non-whitespace column as the
+  hierarchy position. Works for `fn` lines; unknown for odd layouts.
+- Fallback: `E01`/`E06` degrade to `--scan` with a stderr warning. `E04`
+  and `E07` stay hard errors.

@@ -182,6 +182,113 @@ pub fn render_markdown(report: &Report) -> String {
     out
 }
 
+/// Find the 0-based start line of the enclosing `fn` by scanning upward
+/// from 0-based `line`.
+pub fn enclosing_fn_start0(lines: &[&str], line: usize) -> Option<usize> {
+    let mut index = line;
+    loop {
+        if lines[index].contains("fn ") {
+            return Some(index);
+        }
+        if index == 0 {
+            return None;
+        }
+        index -= 1;
+    }
+}
+
+/// Extract a function block starting at 0-based `start`. Returns the block
+/// text and the 1-based end line, balancing braces from the `fn` line.
+pub fn fn_block(lines: &[&str], start: usize) -> (String, u32) {
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    let mut end = start;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+                seen_open = true;
+            } else if ch == '}' {
+                depth -= 1;
+            }
+        }
+        if seen_open && depth <= 0 {
+            end = start + offset;
+            break;
+        }
+        end = start + offset;
+    }
+    (lines[start..=end].join("\n"), (end + 1) as u32)
+}
+
+/// First line of a function body, trimmed — the signature.
+pub fn signature_of(body: &str) -> String {
+    match body.lines().next() {
+        Some(first) => first.trim().to_owned(),
+        None => String::new(),
+    }
+}
+
+/// Function name from a body signature line, or `fallback` when unparseable.
+pub fn fn_name_of(body: &str, fallback: &str) -> String {
+    let first = body.lines().next().unwrap_or("");
+    if let Some(pos) = first.find("fn ") {
+        let rest = &first[pos + 3..];
+        let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            return name.to_owned();
+        }
+    }
+    fallback.to_owned()
+}
+
+/// Build a full [`CallerNode`] from file text and a 1-based call-site line.
+/// Returns `None` when no enclosing `fn` exists (e.g. call at module scope).
+pub fn caller_from_text(text: &str, file: &str, call_line1: u32) -> Option<CallerNode> {
+    let lines: Vec<&str> = text.lines().collect();
+    let call0 = call_line1.checked_sub(1)? as usize;
+    if call0 >= lines.len() {
+        return None;
+    }
+    let start = enclosing_fn_start0(&lines, call0)?;
+    let (body, end_line) = fn_block(&lines, start);
+    Some(CallerNode {
+        name: fn_name_of(&body, file),
+        file: file.to_owned(),
+        line: (start + 1) as u32,
+        end_line,
+        signature: signature_of(&body),
+        body,
+    })
+}
+
+/// Build a [`CallerNode`] from a 0-based LSP symbol range. Used when
+/// rust-analyzer already resolved the exact definition span.
+pub fn caller_from_range(text: &str, file: &str, name: &str, start0: u32, end0: u32) -> CallerNode {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = (start0 as usize).min(lines.len().saturating_sub(1));
+    let end = (end0 as usize).min(lines.len().saturating_sub(1));
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let body = lines[lo..=hi].join("\n");
+    CallerNode {
+        name: if name.is_empty() {
+            fn_name_of(&body, file)
+        } else {
+            name.to_owned()
+        },
+        file: file.to_owned(),
+        line: (lo + 1) as u32,
+        end_line: (hi + 1) as u32,
+        signature: signature_of(&body),
+        body,
+    }
+}
+///
 /// Validate and normalize a raw `--target` string.
 ///
 /// Accepts `path::to::func` or `file.rs:line`. Returns the trimmed input
@@ -233,7 +340,10 @@ pub fn parse_target(raw: &str) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_target, render_markdown, CallerEntry, CallerNode, CallerRef, Report};
+    use super::{
+        caller_from_range, caller_from_text, parse_target, render_markdown, CallerEntry,
+        CallerNode, CallerRef, Report,
+    };
 
     fn sample_report() -> Report {
         Report {
@@ -297,6 +407,27 @@ mod tests {
         assert!(parse_target("").is_err());
         assert!(parse_target("foo::").is_err());
         assert!(parse_target("9lives::x").is_err());
+    }
+
+    #[test]
+    fn caller_from_text_extracts_enclosing_fn() {
+        let text = "use crate::x;\n\npub fn connect(addr: &str) {\n    dial(addr);\n}\n";
+        let caller = caller_from_text(text, "src/ui.rs", 4);
+        assert!(caller.is_some());
+        if let Some(caller) = caller {
+            assert_eq!(caller.name, "connect");
+            assert_eq!(caller.line, 3);
+            assert!(caller.body.contains("dial(addr);"));
+        }
+    }
+
+    #[test]
+    fn caller_from_range_slices_exact_span() {
+        let text = "line1\nfn target() {\n    body();\n}\nline5\n";
+        let caller = caller_from_range(text, "src/a.rs", "target", 1, 3);
+        assert_eq!(caller.line, 2);
+        assert_eq!(caller.end_line, 4);
+        assert_eq!(caller.signature, "fn target() {");
     }
 
     #[test]

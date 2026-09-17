@@ -20,6 +20,7 @@
           rustc
           rustfmt
           clippy
+          rust-analyzer
           gcc
           git
           why3
