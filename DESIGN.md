@@ -58,16 +58,31 @@ Codes:
 - `E06` rust-analyzer request failed or timed out (include request name, timeout secs; suspected: RA still indexing — suggest retry with --timeout).
 - `E07` file read or output write failed (include path and OS error).
 
-## 6. Open items (updated: LSP driver landed)
+## 6. Open items (updated: cold-index race solved)
 
-- `workspace/symbol` polls up to 30s for a non-empty index. Depth-2 queries
-  on a cold index can return empty (observed once: `scan_workspace` showed
-  no depth-2 while `run` correctly showed `main`). Suspected cause: RA still
-  indexing when depth-2 runs. Mitigation candidates: wait for a full index
-  signal, or retry empty depth-2 once after a delay.
-- Per-invocation RA spawn pays full workspace load each run (seconds).
-  Candidate: long-lived RA daemon or cached responses for repeated targets.
-- `file.rs:line` targets use the first non-whitespace column as the
-  hierarchy position. Works for `fn` lines; unknown for odd layouts.
-- Fallback: `E01`/`E06` degrade to `--scan` with a stderr warning. `E04`
-  and `E07` stay hard errors.
+Solved, with evidence:
+
+- `serverStatus/quiescent` never arrives on a bare stdio client (verified:
+  60s probe shows only `workspace/diagnostic/refresh`). It is tracked when
+  present but NOTHING gates on it.
+- Gate is index stability: `workspace/symbol` polls until the answer is
+  non-empty AND unchanged across two polls, or 45s budget. A stable index
+  means empty hierarchy answers are genuine, not races.
+- RA answers `null` (not `[]`) while indexing and for unresolvable
+  positions. All three decoders (`workspace/symbol`, `prepare`, incoming)
+  treat null as empty.
+- RA `prepareCallHierarchy` resolves identifier positions but returns []
+  for mid-body positions (verified raw). `file:line` targets therefore map
+  to a name locally (`fn_name_near`: same line, else below for docs/attrs,
+  else above for bodies) and reuse the symbol path filtered to the file.
+- Workspace root is lexically normalized (trailing `/.` poisoned
+  hand-built `file://` URIs).
+- Per-query retry backstops remain: 20s on empty `prepare`/incoming while
+  not quiescent.
+
+Remaining:
+
+- Per-invocation RA spawn pays full workspace load each run (~30s here).
+  No daemon per operator decision.
+- Unknown targets burn the 45s symbol budget before E04. Candidate: probe
+  a canary query first to separate "index loading" from "unknown name".

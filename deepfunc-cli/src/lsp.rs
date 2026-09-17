@@ -176,9 +176,19 @@ fn read_message(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Str
     }
 }
 
+/// Indexing state from `rust-analyzer/serverStatus` notifications.
+/// `quiescent: true` means the workspace index is complete and empty
+/// hierarchy results are trustworthy (not a cold-index race).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerStatus {
+    seen: bool,
+    quiescent: bool,
+}
+
 pub struct RaClient {
     stdin: Arc<Mutex<ChildStdin>>,
     events: mpsc::Receiver<ClientEvent>,
+    status: Arc<Mutex<ServerStatus>>,
     next_id: i64,
     child: Option<Child>,
     timeout_secs: u64,
@@ -214,8 +224,13 @@ impl RaClient {
             }
         };
         let (events_tx, events_rx) = mpsc::channel::<ClientEvent>();
+        let status = Arc::new(Mutex::new(ServerStatus {
+            seen: false,
+            quiescent: false,
+        }));
         if let Some(stdout) = child_stdout {
             let reply_stdin = Arc::clone(&stdin);
+            let status_tx = Arc::clone(&status);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Ok(Some(text)) = read_message(&mut reader) {
@@ -226,6 +241,23 @@ impl RaClient {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
+                    // Server notification (no id): watch indexing state.
+                    if value.get("id").is_none() {
+                        if value.get("method").and_then(Value::as_str)
+                            == Some("rust-analyzer/serverStatus")
+                        {
+                            let quiescent = value
+                                .get("params")
+                                .and_then(|params| params.get("quiescent"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            if let Ok(mut guard) = status_tx.lock() {
+                                guard.seen = true;
+                                guard.quiescent = quiescent;
+                            }
+                        }
+                        continue;
+                    }
                     // Server-to-client request: best-effort null reply.
                     if value.get("method").is_some() {
                         if let Some(id) = value.get("id") {
@@ -254,6 +286,7 @@ impl RaClient {
         let mut client = Self {
             stdin,
             events: events_rx,
+            status,
             next_id: 1,
             child: Some(child),
             timeout_secs,
@@ -267,6 +300,15 @@ impl RaClient {
         client.request("initialize", params)?;
         client.notify("initialized", json!({}));
         Ok(client)
+    }
+
+    /// True once rust-analyzer reports a complete index. Empty hierarchy
+    /// results are only trustworthy when this holds.
+    pub fn is_quiescent(&self) -> bool {
+        self.status
+            .lock()
+            .map(|guard| guard.quiescent)
+            .unwrap_or(false)
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, Error> {
@@ -342,57 +384,90 @@ impl RaClient {
 
     /// Find function/method symbols matching `query` (rust-analyzer
     /// `workspace/symbol`). Returns only kind Function (12) / Method (6).
-    /// Polls while empty: rust-analyzer loads the workspace asynchronously
-    /// after `initialize`, so the first queries can race indexing.
+    ///
+    /// Cold-index race handling: rust-analyzer fills the symbol index
+    /// incrementally, so the first non-empty answer can still be partial.
+    /// This polls until the answer is non-empty AND stable across two
+    /// consecutive polls (count unchanged), or quiescent, or budget expiry.
+    /// An empty answer after a stable/complete index means genuinely
+    /// unknown — not a race.
     pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
         let start = Instant::now();
-        let budget = Duration::from_secs(30);
+        let budget = Duration::from_secs(45);
+        let mut last_count: Option<usize> = None;
         loop {
             let result = self.request("workspace/symbol", json!({"query": query}))?;
-            let symbols: Vec<SymbolInfo> = match serde_json::from_value(result) {
-                Ok(symbols) => symbols,
-                Err(error) => {
-                    return Err(Error::RequestFailed {
-                        request: "workspace/symbol".to_owned(),
-                        timeout_secs: self.timeout_secs,
-                        detail: "failed to decode symbols: ".to_owned() + &error.to_string(),
-                    })
-                }
-            };
+            // rust-analyzer answers `null` while still indexing. Empty,
+            // not a protocol error — the stability loop below retries.
+            let symbols: Vec<SymbolInfo> =
+                match serde_json::from_value::<Option<Vec<SymbolInfo>>>(result) {
+                    Ok(None) => Vec::new(),
+                    Ok(Some(symbols)) => symbols,
+                    Err(error) => {
+                        return Err(Error::RequestFailed {
+                            request: "workspace/symbol".to_owned(),
+                            timeout_secs: self.timeout_secs,
+                            detail: "failed to decode symbols: ".to_owned() + &error.to_string(),
+                        })
+                    }
+                };
             let functions: Vec<SymbolInfo> = symbols
                 .into_iter()
                 .filter(|symbol| symbol.kind == 6 || symbol.kind == 12)
                 .collect();
-            if !functions.is_empty() || start.elapsed() >= budget {
+            if self.is_quiescent() {
                 return Ok(functions);
             }
-            std::thread::sleep(Duration::from_secs(1));
+            if !functions.is_empty() && last_count == Some(functions.len()) {
+                return Ok(functions);
+            }
+            if start.elapsed() >= budget {
+                return Ok(functions);
+            }
+            last_count = Some(functions.len());
+            std::thread::sleep(Duration::from_secs(2));
         }
     }
 
-    /// Resolve a document position to hierarchy items.
+    /// Resolve a document position to hierarchy items. Retries an empty
+    /// result while still indexing; trusts it once quiescent.
     pub fn prepare_hierarchy(
         &mut self,
         uri: &str,
         line0: u32,
         character: u32,
     ) -> Result<Vec<HierarchyItem>, Error> {
-        let result = self.request(
-            "textDocument/prepareCallHierarchy",
-            json!({"textDocument": {"uri": uri},
-                   "position": {"line": line0, "character": character}}),
-        )?;
-        match serde_json::from_value(result) {
-            Ok(items) => Ok(items),
-            Err(error) => Err(Error::RequestFailed {
-                request: "textDocument/prepareCallHierarchy".to_owned(),
-                timeout_secs: self.timeout_secs,
-                detail: "failed to decode hierarchy: ".to_owned() + &error.to_string(),
-            }),
+        let start = Instant::now();
+        let budget = Duration::from_secs(20);
+        loop {
+            let result = self.request(
+                "textDocument/prepareCallHierarchy",
+                json!({"textDocument": {"uri": uri},
+                       "position": {"line": line0, "character": character}}),
+            )?;
+            let items: Vec<HierarchyItem> =
+                match serde_json::from_value::<Option<Vec<HierarchyItem>>>(result) {
+                    // rust-analyzer answers `null` (not `[]`) when the position
+                    // resolves to no symbol. That is empty, not a protocol error.
+                    Ok(None) => Vec::new(),
+                    Ok(Some(items)) => items,
+                    Err(error) => {
+                        return Err(Error::RequestFailed {
+                            request: "textDocument/prepareCallHierarchy".to_owned(),
+                            timeout_secs: self.timeout_secs,
+                            detail: "failed to decode hierarchy: ".to_owned() + &error.to_string(),
+                        })
+                    }
+                };
+            if !items.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
+                return Ok(items);
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
-    /// Direct callers of one hierarchy item.
+    /// Direct callers of one hierarchy item. Retries an empty result while
+    /// still indexing; trusts it once quiescent (true leaf, not a race).
     pub fn incoming_calls(&mut self, item: &HierarchyItem) -> Result<Vec<IncomingCall>, Error> {
         let item_value = match serde_json::to_value(item) {
             Ok(value) => value,
@@ -404,14 +479,27 @@ impl RaClient {
                 })
             }
         };
-        let result = self.request("callHierarchy/incomingCalls", json!({"item": item_value}))?;
-        match serde_json::from_value(result) {
-            Ok(calls) => Ok(calls),
-            Err(error) => Err(Error::RequestFailed {
-                request: "callHierarchy/incomingCalls".to_owned(),
-                timeout_secs: self.timeout_secs,
-                detail: "failed to decode callers: ".to_owned() + &error.to_string(),
-            }),
+        let start = Instant::now();
+        let budget = Duration::from_secs(20);
+        loop {
+            let result =
+                self.request("callHierarchy/incomingCalls", json!({"item": item_value}))?;
+            let calls: Vec<IncomingCall> =
+                match serde_json::from_value::<Option<Vec<IncomingCall>>>(result) {
+                    Ok(None) => Vec::new(),
+                    Ok(Some(calls)) => calls,
+                    Err(error) => {
+                        return Err(Error::RequestFailed {
+                            request: "callHierarchy/incomingCalls".to_owned(),
+                            timeout_secs: self.timeout_secs,
+                            detail: "failed to decode callers: ".to_owned() + &error.to_string(),
+                        })
+                    }
+                };
+            if !calls.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
+                return Ok(calls);
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 

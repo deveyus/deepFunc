@@ -171,7 +171,10 @@ fn find_workspace_root(start: &Path) -> Result<PathBuf, Error> {
     let mut depth: u32 = 0;
     loop {
         if current.join("Cargo.toml").is_file() {
-            return Ok(current);
+            // Lexical clean: `cwd.join(".")` leaves a trailing `/.`,
+            // which poisons hand-built `file://` URIs (RA matches no
+            // document). Components collection drops `.` segments.
+            return Ok(current.components().collect());
         }
         match current.parent() {
             Some(parent) => {
@@ -344,11 +347,49 @@ fn parse_file_line(root: &Path, target: &str) -> Option<(PathBuf, u32)> {
     Some((root.join(path), number - 1))
 }
 
-/// First non-whitespace character index of a line (for hierarchy position).
-fn indent_of(line: &str) -> u32 {
-    line.bytes()
-        .take_while(|b| *b == b' ' || *b == b'\t')
-        .count() as u32
+/// Function name nearest 0-based `line0`: the signature on the line itself,
+/// else the first signature below (doc comments, attributes), else the
+/// nearest signature above (body positions). Returns `None` when no
+/// signature is nearby (module scope, imports).
+fn fn_name_near(text: &str, line0: u32) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let origin = (line0 as usize).min(lines.len() - 1);
+    let mut below = origin;
+    while below < lines.len() && below < origin + 8 {
+        if let Some(name) = fn_name_on_line(lines[below]) {
+            return Some(name);
+        }
+        // Stop descending past an opening brace: we entered a body.
+        if lines[below].contains('{') {
+            break;
+        }
+        below += 1;
+    }
+    let mut above = origin;
+    loop {
+        if let Some(name) = fn_name_on_line(lines[above]) {
+            return Some(name);
+        }
+        if above == 0 {
+            return None;
+        }
+        above -= 1;
+    }
+}
+
+/// Function name when `line` is a signature line, else `None`.
+fn fn_name_on_line(line: &str) -> Option<String> {
+    let pos = line.find("fn ")?;
+    let rest = &line[pos + 3..];
+    let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 fn lsp_workspace(
@@ -358,13 +399,44 @@ fn lsp_workspace(
     timeout_secs: u64,
 ) -> Result<Vec<CallerEntry>, Error> {
     let mut client = RaClient::spawn(ra_bin, root, timeout_secs)?;
+    // No upfront readiness gate here: each query below polls until the
+    // index it reads is stable, so empty answers are trustworthy.
     // Resolve the target to one hierarchy item.
     let (uri, line0, character) = if let Some((path, line0)) = parse_file_line(root, target) {
         let text = read_file(&path)?;
         let uri = format!("file://{}", path.display());
-        let character = text.lines().nth(line0 as usize).map_or(0, indent_of);
         client.did_open(&uri, &text);
-        (uri, line0, character)
+        // rust-analyzer `prepareCallHierarchy` resolves identifier
+        // positions reliably but NOT arbitrary body positions (verified:
+        // mid-body returns []). So map file:line to a name locally, then
+        // reuse the symbol path filtered to this file.
+        let name = fn_name_near(&text, line0).ok_or_else(|| Error::TargetNotFound {
+            target: target.to_owned(),
+            workspace: root.display().to_string(),
+        })?;
+        let symbols = client.workspace_symbols(&name)?;
+        let wanted_tail = path.display().to_string();
+        let mut picked: Option<(String, u32, u32)> = None;
+        for symbol in &symbols {
+            if symbol.name() != name {
+                continue;
+            }
+            if uri_to_path(symbol.uri()).as_deref() == Some(wanted_tail.as_str())
+                || symbol.uri() == uri
+            {
+                picked = Some((symbol.uri().to_owned(), symbol.line0(), symbol.char0()));
+                break;
+            }
+        }
+        match picked {
+            Some(entry) => entry,
+            None => {
+                return Err(Error::TargetNotFound {
+                    target: target.to_owned(),
+                    workspace: root.display().to_string(),
+                })
+            }
+        }
     } else {
         let ident = target_ident(target);
         let parents: Vec<&str> = target.split("::").collect();
