@@ -1,9 +1,11 @@
-//! Minimal blocking rust-analyzer client over LSP stdio.
+//! Minimal blocking LSP client over stdio, language-agnostic.
 //!
 //! Speaks just enough JSON-RPC for one flow: `initialize`,
-//! `workspace/symbol`, `textDocument/prepareCallHierarchy`,
-//! `callHierarchy/incomingCalls`. Server-to-client requests get a best
-//! effort `null` reply so the server never stalls waiting on us.
+//! `workspace/symbol`, `textDocument/documentSymbol`,
+//! `textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`.
+//! The server program plus args comes from the caller (per-language table
+//! lives in the CLI). Server-to-client requests get a best-effort `null`
+//! reply so the server never stalls waiting on us.
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +30,7 @@ pub struct Range {
     pub end: Position,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Location {
     pub uri: String,
     pub range: Range,
@@ -54,44 +56,6 @@ pub struct HierarchyItem {
     pub selection_range: Range,
 }
 
-impl SymbolInfo {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn container(&self) -> Option<&str> {
-        self.container_name.as_deref()
-    }
-    pub fn uri(&self) -> &str {
-        &self.location.uri
-    }
-    pub fn line0(&self) -> u32 {
-        self.location.range.start.line
-    }
-    pub fn char0(&self) -> u32 {
-        self.location.range.start.character
-    }
-}
-
-impl HierarchyItem {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn uri(&self) -> &str {
-        &self.uri
-    }
-    /// 0-based definition span for body extraction.
-    pub fn def_span0(&self) -> (u32, u32) {
-        (self.range.start.line, self.range.end.line)
-    }
-    /// 0-based identifier position for follow-up hierarchy requests.
-    pub fn sel_pos0(&self) -> (u32, u32) {
-        (
-            self.selection_range.start.line,
-            self.selection_range.start.character,
-        )
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct IncomingCall {
     pub from: HierarchyItem,
@@ -99,17 +63,17 @@ pub struct IncomingCall {
     pub from_ranges: Vec<Range>,
 }
 
-impl IncomingCall {
-    pub fn from(&self) -> &HierarchyItem {
-        &self.from
-    }
-    /// 1-based line of the first call site in the caller.
-    pub fn call_line1(&self) -> u32 {
-        self.from_ranges
-            .first()
-            .map(|range| range.start.line + 1)
-            .unwrap_or(1)
-    }
+/// One node of a `textDocument/documentSymbol` tree. Only position data
+/// is kept: names come from hierarchy items. (Unknown JSON fields such as
+/// `name` are ignored on decode.)
+#[derive(Debug, Deserialize, Clone)]
+pub struct DocumentSymbol {
+    pub kind: u32,
+    pub range: Range,
+    #[serde(rename = "selectionRange")]
+    pub selection_range: Range,
+    #[serde(default)]
+    pub children: Vec<DocumentSymbol>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,29 +88,46 @@ enum ClientEvent {
     Response { id: i64, result: Value },
 }
 
-fn write_message(stdin: &Arc<Mutex<ChildStdin>>, body: &str) -> Result<(), Error> {
+/// Symbol kinds that can have callers (Method, Constructor, Function).
+pub fn is_callable(kind: u32) -> bool {
+    matches!(kind, 6 | 9 | 12)
+}
+
+/// Innermost callable symbol containing 0-based `line0`, or `None`.
+pub fn innermost_callable(symbols: &[DocumentSymbol], line0: u32) -> Option<&DocumentSymbol> {
+    for symbol in symbols {
+        if symbol.range.start.line <= line0 && line0 <= symbol.range.end.line {
+            if let Some(inner) = innermost_callable(&symbol.children, line0) {
+                return Some(inner);
+            }
+            if is_callable(symbol.kind) {
+                return Some(symbol);
+            }
+        }
+    }
+    None
+}
+
+fn write_message(stdin: &Arc<Mutex<ChildStdin>>, body: &str, server: &str) -> Result<(), Error> {
     let framed = format!("Content-Length: {}\r\n\r\n{body}", body.len());
     match stdin.lock() {
         Ok(mut guard) => match guard.write_all(framed.as_bytes()) {
             Ok(()) => match guard.flush() {
                 Ok(()) => Ok(()),
-                Err(error) => Err(Error::RequestFailed {
-                    request: "stdio-write".to_owned(),
-                    timeout_secs: 0,
-                    detail: error.to_string(),
-                }),
+                Err(error) => Err(guard_dropped_error(server, error.to_string())),
             },
-            Err(error) => Err(Error::RequestFailed {
-                request: "stdio-write".to_owned(),
-                timeout_secs: 0,
-                detail: error.to_string(),
-            }),
+            Err(error) => Err(guard_dropped_error(server, error.to_string())),
         },
-        Err(error) => Err(Error::RequestFailed {
-            request: "stdio-write".to_owned(),
-            timeout_secs: 0,
-            detail: error.to_string(),
-        }),
+        Err(error) => Err(guard_dropped_error(server, error.to_string())),
+    }
+}
+
+fn guard_dropped_error(server: &str, detail: String) -> Error {
+    Error::RequestFailed {
+        server: server.to_owned(),
+        request: "stdio-write".to_owned(),
+        timeout_secs: 0,
+        detail,
     }
 }
 
@@ -185,20 +166,36 @@ struct ServerStatus {
     quiescent: bool,
 }
 
-pub struct RaClient {
+pub struct LanguageClient {
     stdin: Arc<Mutex<ChildStdin>>,
     events: mpsc::Receiver<ClientEvent>,
     status: Arc<Mutex<ServerStatus>>,
+    notes: Arc<Mutex<Vec<String>>>,
+    server_label: String,
     next_id: i64,
     child: Option<Child>,
     timeout_secs: u64,
 }
 
-impl RaClient {
-    /// Spawn `ra_bin` and run `initialize` against `root`.
-    pub fn spawn(ra_bin: &str, root: &Path, timeout_secs: u64) -> Result<Self, Error> {
+impl LanguageClient {
+    /// Spawn `program` with `args` and run `initialize` against `root`.
+    /// `server_label` names the server in error output (e.g. `gopls`).
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        root: &Path,
+        timeout_secs: u64,
+        language: &str,
+        install_hint: &str,
+    ) -> Result<Self, Error> {
         let root_uri = format!("file://{}", root.display());
-        let mut child = match Command::new(ra_bin)
+        let command_line = if args.is_empty() {
+            program.to_owned()
+        } else {
+            program.to_owned() + " " + &args.join(" ")
+        };
+        let mut child = match Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -206,8 +203,11 @@ impl RaClient {
         {
             Ok(child) => child,
             Err(error) => {
-                return Err(Error::RaNotFound {
-                    searched_path: format!("{ra_bin} ({error})"),
+                return Err(Error::ServerNotFound {
+                    language: language.to_owned(),
+                    server: command_line,
+                    detail: error.to_string(),
+                    install_hint: install_hint.to_owned(),
                 })
             }
         };
@@ -217,9 +217,10 @@ impl RaClient {
             Some(stdin) => Arc::new(Mutex::new(stdin)),
             None => {
                 return Err(Error::RequestFailed {
+                    server: command_line.clone(),
                     request: "spawn".to_owned(),
                     timeout_secs,
-                    detail: "rust-analyzer started without a stdin pipe".to_owned(),
+                    detail: "server started without a stdin pipe".to_owned(),
                 })
             }
         };
@@ -228,9 +229,13 @@ impl RaClient {
             seen: false,
             quiescent: false,
         }));
+        let notes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let label = command_line.clone();
         if let Some(stdout) = child_stdout {
             let reply_stdin = Arc::clone(&stdin);
             let status_tx = Arc::clone(&status);
+            let notes_tx = Arc::clone(&notes);
+            let reply_label = label.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Ok(Some(text)) = read_message(&mut reader) {
@@ -241,19 +246,32 @@ impl RaClient {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    // Server notification (no id): watch indexing state.
+                    // Server notification (no id): watch indexing state and
+                    // keep a short diagnostic log for failure output.
                     if value.get("id").is_none() {
-                        if value.get("method").and_then(Value::as_str)
-                            == Some("rust-analyzer/serverStatus")
-                        {
-                            let quiescent = value
-                                .get("params")
-                                .and_then(|params| params.get("quiescent"))
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            if let Ok(mut guard) = status_tx.lock() {
-                                guard.seen = true;
-                                guard.quiescent = quiescent;
+                        if let Some(method) = value.get("method").and_then(Value::as_str) {
+                            if method == "rust-analyzer/serverStatus" {
+                                let quiescent = value
+                                    .get("params")
+                                    .and_then(|params| params.get("quiescent"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if let Ok(mut guard) = status_tx.lock() {
+                                    guard.seen = true;
+                                    guard.quiescent = quiescent;
+                                }
+                            }
+                            if let Ok(mut guard) = notes_tx.lock() {
+                                if guard.len() < 30 {
+                                    let mut summary =
+                                        value.get("params").map_or("null".to_owned(), |params| {
+                                            serde_json::to_string(params).unwrap_or_default()
+                                        });
+                                    if summary.len() > 300 {
+                                        summary.truncate(300);
+                                    }
+                                    guard.push(method.to_owned() + " :: " + &summary);
+                                }
                             }
                         }
                         continue;
@@ -263,7 +281,7 @@ impl RaClient {
                         if let Some(id) = value.get("id") {
                             let reply = json!({"jsonrpc": "2.0", "id": id, "result": null});
                             if let Ok(body) = serde_json::to_string(&reply) {
-                                let _ignored = write_message(&reply_stdin, &body);
+                                let _ignored = write_message(&reply_stdin, &body, &reply_label);
                             }
                         }
                         continue;
@@ -287,6 +305,8 @@ impl RaClient {
             stdin,
             events: events_rx,
             status,
+            notes,
+            server_label: label,
             next_id: 1,
             child: Some(child),
             timeout_secs,
@@ -302,13 +322,30 @@ impl RaClient {
         Ok(client)
     }
 
-    /// True once rust-analyzer reports a complete index. Empty hierarchy
+    /// True once the server reports a complete index. Empty hierarchy
     /// results are only trustworthy when this holds.
     pub fn is_quiescent(&self) -> bool {
         self.status
             .lock()
             .map(|guard| guard.quiescent)
             .unwrap_or(false)
+    }
+
+    /// Collected server notifications (most recent last), for failure output.
+    pub fn drain_notes(&self) -> Vec<String> {
+        match self.notes.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn fail(&self, request: &str, detail: String) -> Error {
+        Error::RequestFailed {
+            server: self.server_label.clone(),
+            request: request.to_owned(),
+            timeout_secs: self.timeout_secs,
+            detail,
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, Error> {
@@ -323,43 +360,30 @@ impl RaClient {
         let body = match serde_json::to_string(&message) {
             Ok(body) => body,
             Err(error) => {
-                return Err(Error::RequestFailed {
-                    request: method.to_owned(),
-                    timeout_secs: self.timeout_secs,
-                    detail: "failed to encode request: ".to_owned() + &error.to_string(),
-                })
+                return Err(self.fail(
+                    method,
+                    "failed to encode request: ".to_owned() + &error.to_string(),
+                ));
             }
         };
-        write_message(&self.stdin, &body)?;
+        write_message(&self.stdin, &body, &self.server_label)?;
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(Error::RequestFailed {
-                    request: method.to_owned(),
-                    timeout_secs: self.timeout_secs,
-                    detail: "timed out waiting for a response".to_owned(),
-                });
+                return Err(self.fail(method, "timed out waiting for a response".to_owned()));
             }
             match self.events.recv_timeout(remaining) {
                 Ok(ClientEvent::Response { id: got, result }) => {
                     if got == id {
                         if result.get("error").is_some() {
-                            return Err(Error::RequestFailed {
-                                request: method.to_owned(),
-                                timeout_secs: self.timeout_secs,
-                                detail: result.to_string(),
-                            });
+                            return Err(self.fail(method, result.to_string()));
                         }
                         return Ok(result);
                     }
                 }
                 Err(_) => {
-                    return Err(Error::RequestFailed {
-                        request: method.to_owned(),
-                        timeout_secs: self.timeout_secs,
-                        detail: "timed out waiting for a response".to_owned(),
-                    })
+                    return Err(self.fail(method, "timed out waiting for a response".to_owned()));
                 }
             }
         }
@@ -368,23 +392,22 @@ impl RaClient {
     fn notify(&mut self, method: &str, params: Value) {
         let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
         if let Ok(text) = serde_json::to_string(&body) {
-            let _ignored = write_message(&self.stdin, &text);
+            let _ignored = write_message(&self.stdin, &text, &self.server_label);
         }
     }
 
     /// Open a file so later hierarchy requests resolve against fresh text.
-    pub fn did_open(&mut self, uri: &str, text: &str) {
+    pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
         self.notify(
             "textDocument/didOpen",
             json!({"textDocument": {
-                "uri": uri, "languageId": "rust", "version": 1, "text": text,
+                "uri": uri, "languageId": language_id, "version": 1, "text": text,
             }}),
         );
     }
 
-    /// Single `workspace/symbol` round trip, filtered to kind Function (12)
-    /// / Method (6). Treats `null` as empty (rust-analyzer answers `null`
-    /// while still indexing — not a protocol error).
+    /// Single `workspace/symbol` round trip, filtered to callable kinds.
+    /// Treats `null` as empty (servers answer `null` while still indexing).
     fn request_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
         let result = self.request("workspace/symbol", json!({"query": query}))?;
         let symbols: Vec<SymbolInfo> =
@@ -392,24 +415,25 @@ impl RaClient {
                 Ok(None) => Vec::new(),
                 Ok(Some(symbols)) => symbols,
                 Err(error) => {
-                    return Err(Error::RequestFailed {
-                        request: "workspace/symbol".to_owned(),
-                        timeout_secs: self.timeout_secs,
-                        detail: "failed to decode symbols: ".to_owned() + &error.to_string(),
-                    })
+                    return Err(self.fail(
+                        "workspace/symbol",
+                        "failed to decode symbols: ".to_owned() + &error.to_string(),
+                    ));
                 }
             };
         Ok(symbols
             .into_iter()
-            .filter(|symbol| symbol.kind == 6 || symbol.kind == 12)
+            .filter(|symbol| is_callable(symbol.kind))
             .collect())
     }
 
     /// Wait until the symbol index is loaded, using a canary query that
     /// matches in virtually every workspace. Polls until the canary answer
     /// is non-empty AND unchanged across two polls, or 30s budget.
-    /// Returns true when the index looks ready. Call once after spawn;
-    /// after this, an empty target lookup means genuinely unknown.
+    /// Errors count as not-ready (some servers fail queries while their
+    /// project model loads). Returns true when the index looks ready. Call
+    /// once after spawn; after this, an empty target lookup means
+    /// genuinely unknown.
     pub fn ensure_index_ready(&mut self) -> bool {
         let start = Instant::now();
         let budget = Duration::from_secs(30);
@@ -425,7 +449,9 @@ impl RaClient {
                     }
                     last_count = Some(functions.len());
                 }
-                Err(_) => return false,
+                Err(_) => {
+                    last_count = None;
+                }
             }
             if start.elapsed() >= budget {
                 return self.is_quiescent();
@@ -434,16 +460,58 @@ impl RaClient {
         }
     }
 
-    /// Find function/method symbols matching `query`. Assumes
+    /// Find callable symbols matching `query`. Assumes
     /// [`ensure_index_ready`](Self::ensure_index_ready) ran first: one
-    /// request, one spaced retry for reanalysis races, then trust empty.
+    /// request, then short retries (empty AND errored — a freshly loading
+    /// project fails queries before it serves them), then trust the answer.
     pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
-        let functions = self.request_symbols(query)?;
-        if !functions.is_empty() {
-            return Ok(functions);
+        let start = Instant::now();
+        let budget = Duration::from_secs(20);
+        loop {
+            match self.request_symbols(query) {
+                Ok(functions) => {
+                    if !functions.is_empty() || start.elapsed() >= budget {
+                        return Ok(functions);
+                    }
+                }
+                Err(error) => {
+                    if start.elapsed() >= budget {
+                        return Err(error);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
-        std::thread::sleep(Duration::from_secs(3));
-        self.request_symbols(query)
+    }
+
+    /// Hierarchical symbols of one open document. Servers answer
+    /// `DocumentSymbol[]` or (older) flat `SymbolInformation[]`; both are
+    /// normalized to a tree.
+    pub fn document_symbols(&mut self, uri: &str) -> Result<Vec<DocumentSymbol>, Error> {
+        let result = self.request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": uri}}),
+        )?;
+        if let Ok(symbols) = serde_json::from_value::<Option<Vec<DocumentSymbol>>>(result.clone()) {
+            return Ok(symbols.unwrap_or_default());
+        }
+        match serde_json::from_value::<Option<Vec<SymbolInfo>>>(result) {
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(infos)) => Ok(infos
+                .into_iter()
+                .filter(|info| is_callable(info.kind))
+                .map(|info| DocumentSymbol {
+                    kind: info.kind,
+                    range: info.location.range.clone(),
+                    selection_range: info.location.range,
+                    children: Vec::new(),
+                })
+                .collect()),
+            Err(error) => Err(self.fail(
+                "textDocument/documentSymbol",
+                "failed to decode symbols: ".to_owned() + &error.to_string(),
+            )),
+        }
     }
 
     /// Resolve a document position to hierarchy items. The readiness gate
@@ -465,16 +533,15 @@ impl RaClient {
             )?;
             let items: Vec<HierarchyItem> =
                 match serde_json::from_value::<Option<Vec<HierarchyItem>>>(result) {
-                    // rust-analyzer answers `null` (not `[]`) when the position
-                    // resolves to no symbol. That is empty, not a protocol error.
+                    // Servers answer `null` (not `[]`) when the position
+                    // resolves to no symbol. Empty, not a protocol error.
                     Ok(None) => Vec::new(),
                     Ok(Some(items)) => items,
                     Err(error) => {
-                        return Err(Error::RequestFailed {
-                            request: "textDocument/prepareCallHierarchy".to_owned(),
-                            timeout_secs: self.timeout_secs,
-                            detail: "failed to decode hierarchy: ".to_owned() + &error.to_string(),
-                        })
+                        return Err(self.fail(
+                            "textDocument/prepareCallHierarchy",
+                            "failed to decode hierarchy: ".to_owned() + &error.to_string(),
+                        ));
                     }
                 };
             if !items.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
@@ -486,16 +553,15 @@ impl RaClient {
 
     /// Direct callers of one hierarchy item. Same backstop policy as
     /// [`prepare_hierarchy`](Self::prepare_hierarchy): trust empty fast,
-    /// since readiness was gated upfront. True leaves cost ~5s, not 20s.
+    /// since readiness was gated upfront.
     pub fn incoming_calls(&mut self, item: &HierarchyItem) -> Result<Vec<IncomingCall>, Error> {
         let item_value = match serde_json::to_value(item) {
             Ok(value) => value,
             Err(error) => {
-                return Err(Error::RequestFailed {
-                    request: "callHierarchy/incomingCalls".to_owned(),
-                    timeout_secs: self.timeout_secs,
-                    detail: "failed to encode item: ".to_owned() + &error.to_string(),
-                })
+                return Err(self.fail(
+                    "callHierarchy/incomingCalls",
+                    "failed to encode item: ".to_owned() + &error.to_string(),
+                ));
             }
         };
         let start = Instant::now();
@@ -508,11 +574,10 @@ impl RaClient {
                     Ok(None) => Vec::new(),
                     Ok(Some(calls)) => calls,
                     Err(error) => {
-                        return Err(Error::RequestFailed {
-                            request: "callHierarchy/incomingCalls".to_owned(),
-                            timeout_secs: self.timeout_secs,
-                            detail: "failed to decode callers: ".to_owned() + &error.to_string(),
-                        })
+                        return Err(self.fail(
+                            "callHierarchy/incomingCalls",
+                            "failed to decode callers: ".to_owned() + &error.to_string(),
+                        ));
                     }
                 };
             if !calls.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
@@ -528,7 +593,7 @@ impl RaClient {
         self.next_id += 1;
         let body = json!({"jsonrpc": "2.0", "id": id, "method": "shutdown", "params": null});
         if let Ok(text) = serde_json::to_string(&body) {
-            let _ignored = write_message(&self.stdin, &text);
+            let _ignored = write_message(&self.stdin, &text, &self.server_label);
         }
         self.notify("exit", Value::Null);
         if let Some(mut child) = self.child.take() {
@@ -537,11 +602,76 @@ impl RaClient {
     }
 }
 
-impl Drop for RaClient {
+impl Drop for LanguageClient {
     fn drop(&mut self) {
         if self.child.is_some() {
             self.shutdown();
         }
+    }
+}
+
+impl SymbolInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn container(&self) -> Option<&str> {
+        self.container_name.as_deref()
+    }
+    pub fn uri(&self) -> &str {
+        &self.location.uri
+    }
+    pub fn line0(&self) -> u32 {
+        self.location.range.start.line
+    }
+    pub fn char0(&self) -> u32 {
+        self.location.range.start.character
+    }
+}
+
+impl HierarchyItem {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// LSP SymbolKind (2 = Module, 6 = Method, 9 = Constructor, 12 = Function).
+    pub fn kind(&self) -> u32 {
+        self.kind
+    }
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+    /// 0-based definition span for body extraction.
+    pub fn def_span0(&self) -> (u32, u32) {
+        (self.range.start.line, self.range.end.line)
+    }
+    /// 0-based identifier position for follow-up hierarchy requests.
+    pub fn sel_pos0(&self) -> (u32, u32) {
+        (
+            self.selection_range.start.line,
+            self.selection_range.start.character,
+        )
+    }
+}
+
+impl IncomingCall {
+    pub fn from(&self) -> &HierarchyItem {
+        &self.from
+    }
+    /// 1-based line of the first call site in the caller.
+    pub fn call_line1(&self) -> u32 {
+        self.from_ranges
+            .first()
+            .map(|range| range.start.line + 1)
+            .unwrap_or(1)
+    }
+}
+
+impl DocumentSymbol {
+    /// 0-based identifier position for hierarchy requests.
+    pub fn sel_pos0(&self) -> (u32, u32) {
+        (
+            self.selection_range.start.line,
+            self.selection_range.start.character,
+        )
     }
 }
 

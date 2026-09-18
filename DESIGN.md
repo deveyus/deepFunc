@@ -9,9 +9,35 @@ Out of scope: cross-language support, exact macro expansion, IDE integration.
 ## 2. Components
 
 Three crates: `deepfunc-core` (lib, pure call-graph logic + formatting),
-`deepfunc-cli` (bin, rust-analyzer LSP driver + file IO), `deepfunc-mcp`
+`deepfunc-cli` (bin, multi-language LSP driver + file IO), `deepfunc-mcp`
 (bin, rmcp stdio server with one `callers` tool that shells out to the CLI
 via `DEEPFUNC_BIN`). Core stays pure. CLI owns LSP. MCP owns protocol.
+
+## 2b. Languages (rust, python, go; typescript blocked)
+
+One `Language` table in `deepfunc-cli`: server command, LSP language ID,
+workspace markers, source extensions, install hint, and an optional
+`broken` flag that fails loudly (E08) instead of guessing. `--lang`
+selects; `--server-bin` overrides the program (table args kept).
+
+- rust: rust-analyzer. Full bodies at depth 1 (server spans are complete).
+- python: pyright. Module-scope callers report the call-site line as
+  their signature (kind Module has none).
+- go: gopls. Definition spans are declaration-line narrow; bodies at
+  depth 1 are signatures until gopls widens spans or we resolve them via
+  documentSymbol ranges.
+- typescript: BLOCKED (E08). typescript-language-server 5.3.0 and npm
+  6.0.0 never forward tsserver-backed requests once a project loads:
+  tsserver's own log shows a healthy configured project loading in ~1s,
+  but no navto/hover/prepare command ever arrives (~15 raw probes:
+  instant errors pre-load, silence post-load, both versions, fixture and
+  real project). Unblocks when a server version answers post-load
+  requests; remove the `broken` flag then. C++ excluded by operator
+  decision (use Rust).
+
+No scan fallback exists by design: E01/E04/E06/E08 are loud errors.
+Server notifications (window/logMessage et al.) are captured and dumped
+to stderr on failure, so config errors surface with the typed error.
 
 ## 3. Request flow
 

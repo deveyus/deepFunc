@@ -11,34 +11,47 @@ use std::fmt::{self, Display, Formatter};
 /// Stable error codes. Never renumber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// E01: rust-analyzer binary missing.
-    RaNotFound { searched_path: String },
-    /// E02: no Cargo.toml walking up from start dir.
-    WorkspaceNotFound { start_dir: String, depth: u32 },
+    /// E01: language server binary missing.
+    ServerNotFound {
+        language: String,
+        server: String,
+        detail: String,
+        install_hint: String,
+    },
+    /// E02: no workspace marker walking up from start dir.
+    WorkspaceNotFound {
+        start_dir: String,
+        depth: u32,
+        markers: Vec<String>,
+    },
     /// E03: target string did not parse.
     BadTarget { received: String },
     /// E04: prepareCallHierarchy returned nothing.
     TargetNotFound { target: String, workspace: String },
     /// E06: an LSP request failed or timed out.
     RequestFailed {
+        server: String,
         request: String,
         timeout_secs: u64,
         detail: String,
     },
     /// E07: filesystem failure with path context.
     Io { path: String, message: String },
+    /// E08: language wired but known-broken (loud gate, never silent wrongness).
+    Unsupported { language: String, reason: String },
 }
 
 impl Error {
     /// Stable code string, e.g. "E01".
     pub fn code(&self) -> &'static str {
         match self {
-            Self::RaNotFound { .. } => "E01",
+            Self::ServerNotFound { .. } => "E01",
             Self::WorkspaceNotFound { .. } => "E02",
             Self::BadTarget { .. } => "E03",
             Self::TargetNotFound { .. } => "E04",
             Self::RequestFailed { .. } => "E06",
             Self::Io { .. } => "E07",
+            Self::Unsupported { .. } => "E08",
         }
     }
 }
@@ -46,13 +59,23 @@ impl Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RaNotFound { searched_path } => write!(
+            Self::ServerNotFound {
+                language,
+                server,
+                detail,
+                install_hint,
+            } => write!(
                 f,
-                "error[E01]: rust-analyzer binary not found\n --> PATH: {searched_path}\n  |\n  | note: searched PATH for `rust-analyzer` and found nothing executable\n  | help: suspected cause: component not installed. Run `rustup component add rust-analyzer` or pass `--ra-bin /path/to/rust-analyzer`"
+                "error[E01]: language server not found\n --> language: {language}\n  |\n  | note: could not start `{server}` ({detail})\n  | help: install it: {install_hint}\n  | help: or pass `--server-bin /path/to/server`"
             ),
-            Self::WorkspaceNotFound { start_dir, depth } => write!(
+            Self::WorkspaceNotFound {
+                start_dir,
+                depth,
+                markers,
+            } => write!(
                 f,
-                "error[E02]: workspace root not found\n --> cwd: {start_dir}\n  |\n  | note: walked up {depth} parents, found no Cargo.toml\n  | help: suspected cause: wrong --project dir. Run from inside the workspace or pass `--project /path/with/Cargo.toml`"
+                "error[E02]: workspace root not found\n --> cwd: {start_dir}\n  |\n  | note: walked up {depth} parents, found none of [{}]\n  | help: suspected cause: wrong --project dir. Run from inside the workspace or pass `--project /path/with/<marker>`",
+                markers.join(", ")
             ),
             Self::BadTarget { received } => write!(
                 f,
@@ -63,16 +86,21 @@ impl Display for Error {
                 "error[E04]: target definition not found\n --> workspace: {workspace}\n  |\n  | note: symbol index was ready; `workspace/symbol` and `prepareCallHierarchy` found no definition for `{target}`\n  | help: suspected cause: wrong name or module path. Check spelling; for trait impls use the fully-qualified path; for `file.rs:line` targets confirm the line sits on (or just above) the `fn` item"
             ),
             Self::RequestFailed {
+                server,
                 request,
                 timeout_secs,
                 detail,
             } => write!(
                 f,
-                "error[E06]: rust-analyzer request failed\n --> request: {request}\n  |\n  | note: {detail} (timeout {timeout_secs}s)\n  | help: suspected cause: rust-analyzer still indexing. Retry with `--timeout 120`; if it persists, open the workspace in an editor to confirm RA starts cleanly"
+                "error[E06]: {server} request failed\n --> request: {request}\n  |\n  | note: {detail} (timeout {timeout_secs}s)\n  | help: suspected cause: misconfigured project (read the server error above) or a still-loading index (retry with `--timeout 180`)"
             ),
             Self::Io { path, message } => write!(
                 f,
                 "error[E07]: filesystem failure\n --> path: {path}\n  |\n  | note: {message}\n  | help: suspected cause: missing file or permissions. Check the path exists and is readable"
+            ),
+            Self::Unsupported { language, reason } => write!(
+                f,
+                "error[E08]: language supported but unavailable\n --> language: {language}\n  |\n  | note: {reason}\n  | help: no fallback exists by design (a wrong answer is worse than none). Track DESIGN.md §6 for unblock conditions."
             ),
         }
     }
@@ -182,45 +210,6 @@ pub fn render_markdown(report: &Report) -> String {
     out
 }
 
-/// Find the 0-based start line of the enclosing `fn` by scanning upward
-/// from 0-based `line`.
-pub fn enclosing_fn_start0(lines: &[&str], line: usize) -> Option<usize> {
-    let mut index = line;
-    loop {
-        if lines[index].contains("fn ") {
-            return Some(index);
-        }
-        if index == 0 {
-            return None;
-        }
-        index -= 1;
-    }
-}
-
-/// Extract a function block starting at 0-based `start`. Returns the block
-/// text and the 1-based end line, balancing braces from the `fn` line.
-pub fn fn_block(lines: &[&str], start: usize) -> (String, u32) {
-    let mut depth: i32 = 0;
-    let mut seen_open = false;
-    let mut end = start;
-    for (offset, line) in lines[start..].iter().enumerate() {
-        for ch in line.chars() {
-            if ch == '{' {
-                depth += 1;
-                seen_open = true;
-            } else if ch == '}' {
-                depth -= 1;
-            }
-        }
-        if seen_open && depth <= 0 {
-            end = start + offset;
-            break;
-        }
-        end = start + offset;
-    }
-    (lines[start..=end].join("\n"), (end + 1) as u32)
-}
-
 /// First line of a function body, trimmed — the signature.
 pub fn signature_of(body: &str) -> String {
     match body.lines().next() {
@@ -229,7 +218,9 @@ pub fn signature_of(body: &str) -> String {
     }
 }
 
-/// Function name from a body signature line, or `fallback` when unparseable.
+/// Function name from a Rust body signature line, or `fallback` when
+/// unparseable. Only used when the server sent an empty name; every
+/// supported server sends names.
 pub fn fn_name_of(body: &str, fallback: &str) -> String {
     let first = body.lines().next().unwrap_or("");
     if let Some(pos) = first.find("fn ") {
@@ -243,28 +234,8 @@ pub fn fn_name_of(body: &str, fallback: &str) -> String {
     fallback.to_owned()
 }
 
-/// Build a full [`CallerNode`] from file text and a 1-based call-site line.
-/// Returns `None` when no enclosing `fn` exists (e.g. call at module scope).
-pub fn caller_from_text(text: &str, file: &str, call_line1: u32) -> Option<CallerNode> {
-    let lines: Vec<&str> = text.lines().collect();
-    let call0 = call_line1.checked_sub(1)? as usize;
-    if call0 >= lines.len() {
-        return None;
-    }
-    let start = enclosing_fn_start0(&lines, call0)?;
-    let (body, end_line) = fn_block(&lines, start);
-    Some(CallerNode {
-        name: fn_name_of(&body, file),
-        file: file.to_owned(),
-        line: (start + 1) as u32,
-        end_line,
-        signature: signature_of(&body),
-        body,
-    })
-}
-
 /// Build a [`CallerNode`] from a 0-based LSP symbol range. Used when
-/// rust-analyzer already resolved the exact definition span.
+/// the language server already resolved the exact definition span.
 pub fn caller_from_range(text: &str, file: &str, name: &str, start0: u32, end0: u32) -> CallerNode {
     let lines: Vec<&str> = text.lines().collect();
     let start = (start0 as usize).min(lines.len().saturating_sub(1));
@@ -291,8 +262,8 @@ pub fn caller_from_range(text: &str, file: &str, name: &str, start0: u32, end0: 
 ///
 /// Validate and normalize a raw `--target` string.
 ///
-/// Accepts `path::to::func` or `file.rs:line`. Returns the trimmed input
-/// on success so the LSP layer receives a canonical value.
+/// Accepts `path::to::func`, `path.to.func`, or `file.ext:line`. Returns
+/// the trimmed input on success so the LSP layer receives a canonical value.
 pub fn parse_target(raw: &str) -> Result<String, Error> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -300,15 +271,16 @@ pub fn parse_target(raw: &str) -> Result<String, Error> {
             received: raw.to_owned(),
         });
     }
-    // file.rs:line form
+    // file.ext:line form (any extension, any language)
     if let Some((path, line)) = trimmed.rsplit_once(':') {
-        if path.ends_with(".rs") && !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) {
+        if path.contains('.') && !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) {
             return Ok(trimmed.to_owned());
         }
     }
-    // path::to::func form: at least one ident, segments split by ::
+    // Dotted or double-colon path form: normalize :: to . then validate.
+    let dotted = trimmed.replace("::", ".");
     let mut segments = 0;
-    for seg in trimmed.split("::") {
+    for seg in dotted.split('.') {
         if seg.is_empty() {
             return Err(Error::BadTarget {
                 received: raw.to_owned(),
@@ -341,8 +313,8 @@ pub fn parse_target(raw: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        caller_from_range, caller_from_text, parse_target, render_markdown, CallerEntry,
-        CallerNode, CallerRef, Report,
+        caller_from_range, parse_target, render_markdown, CallerEntry, CallerNode, CallerRef,
+        Report,
     };
 
     fn sample_report() -> Report {
@@ -397,8 +369,16 @@ mod tests {
             "crate::net::dial"
         );
         assert_eq!(
+            parse_target("os.path.join").unwrap_or_default(),
+            "os.path.join"
+        );
+        assert_eq!(
             parse_target("src/net.rs:120").unwrap_or_default(),
             "src/net.rs:120"
+        );
+        assert_eq!(
+            parse_target("pkg/mod.py:7").unwrap_or_default(),
+            "pkg/mod.py:7"
         );
     }
 
@@ -407,18 +387,7 @@ mod tests {
         assert!(parse_target("").is_err());
         assert!(parse_target("foo::").is_err());
         assert!(parse_target("9lives::x").is_err());
-    }
-
-    #[test]
-    fn caller_from_text_extracts_enclosing_fn() {
-        let text = "use crate::x;\n\npub fn connect(addr: &str) {\n    dial(addr);\n}\n";
-        let caller = caller_from_text(text, "src/ui.rs", 4);
-        assert!(caller.is_some());
-        if let Some(caller) = caller {
-            assert_eq!(caller.name, "connect");
-            assert_eq!(caller.line, 3);
-            assert!(caller.body.contains("dial(addr);"));
-        }
+        assert!(parse_target("foo..bar").is_err());
     }
 
     #[test]
@@ -435,6 +404,7 @@ mod tests {
         let error = super::Error::WorkspaceNotFound {
             start_dir: "/tmp/foo".to_owned(),
             depth: 4,
+            markers: vec!["Cargo.toml".to_owned()],
         };
         let text = format!("{error}");
         assert!(text.contains("E02"));

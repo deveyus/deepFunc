@@ -8,8 +8,8 @@
 #![forbid(unsafe_code)]
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{tool, tool_router, ErrorData};
 use rmcp::schemars;
+use rmcp::{tool, tool_router, ErrorData};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -20,14 +20,15 @@ pub struct DeepFuncMcp {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CallersReq {
-    /// Workspace directory (or subdir) containing Cargo.toml.
+    /// Workspace directory (or subdir) containing the project marker.
     pub project: String,
-    /// Target function: `path::to::function` or `file.rs:line`.
+    /// Target function: `path.to.fn`, `path::to::fn`, or `file.ext:line`.
     pub target: String,
-    /// Seconds for the whole run, including rust-analyzer load. Default 180.
+    /// Language: rust (default), python, go. Typescript is wired but
+    /// blocked (E08: its server never answers post-load requests).
+    pub lang: Option<String>,
+    /// Seconds for the whole run, including server load. Default 180.
     pub timeout_secs: Option<u64>,
-    /// Textual fallback when rust-analyzer is unavailable (less accurate).
-    pub scan: Option<bool>,
 }
 
 fn fail(message: String) -> ErrorData {
@@ -50,21 +51,19 @@ fn run_cli(bin: &str, args: &[String]) -> Result<String, ErrorData> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        Err(fail(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
+        Err(fail(String::from_utf8_lossy(&output.stderr).into_owned()))
     }
 }
 
 #[tool_router(server_handler)]
 impl DeepFuncMcp {
-    /// Caller context for one Rust function: depth-1 caller bodies plus
-    /// depth-2 caller signatures, as one markdown document for LLM context.
-    /// Type-accurate via rust-analyzer. SLOW on cold workspaces (~30-60s
-    /// for RA load): raise the client MCP timeout (opencode
-    /// `experimental.mcp_timeout`) if calls time out.
+    /// Caller context for one function in rust/python/go: depth-1 caller
+    /// bodies plus depth-2 caller signatures, as one markdown document for
+    /// LLM context. Type-accurate via the language's LSP server. SLOW on
+    /// cold workspaces (~30-60s for server load): raise the client MCP
+    /// timeout (opencode `experimental.mcp_timeout`) if calls time out.
     #[tool(
-        description = "Caller context for a Rust function (depth-1 bodies, depth-2 signatures) as markdown. Params: project (workspace dir), target (path::to::fn or file.rs:line), timeout_secs (default 180), scan (textual fallback). SLOW ~30-60s cold: raise client mcp_timeout."
+        description = "Caller context for a function (depth-1 bodies, depth-2 signatures) as markdown. Params: project (workspace dir), target (path.to.fn or file.ext:line), lang (rust|python|go, default rust), timeout_secs (default 180). SLOW ~30-60s cold: raise client mcp_timeout."
     )]
     async fn callers(
         &self,
@@ -77,17 +76,18 @@ impl DeepFuncMcp {
             req.project,
             "--target".to_owned(),
             req.target,
+            "--lang".to_owned(),
+            req.lang.unwrap_or_else(|| "rust".to_owned()),
             "--timeout".to_owned(),
             budget.saturating_sub(15).max(30).to_string(),
         ];
-        if req.scan.unwrap_or(false) {
-            args.push("--scan".to_owned());
-        }
         let worker = tokio::task::spawn_blocking(move || run_cli(&bin, &args));
         match tokio::time::timeout(Duration::from_secs(budget), worker).await {
             Ok(joined) => match joined {
                 Ok(result) => result.map(Json),
-                Err(error) => Err(fail("deepfunc worker failed: ".to_owned() + &error.to_string())),
+                Err(error) => Err(fail(
+                    "deepfunc worker failed: ".to_owned() + &error.to_string(),
+                )),
             },
             Err(_) => Err(fail(
                 "deepfunc call timed out after ".to_owned()

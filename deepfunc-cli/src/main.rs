@@ -1,9 +1,9 @@
-//! deepFunc CLI — rust-analyzer LSP driver with a syntactic scan fallback.
+//! deepFunc CLI — multi-language caller context over LSP.
 //!
-//! Default engine resolves the target through rust-analyzer
-//! (`workspace/symbol` then `prepareCallHierarchy` / `incomingCalls`), so
-//! results are type-accurate. `--scan` keeps the old textual matcher for
-//! offline use; its output footer says so.
+//! Resolves the target through the language's server (`workspace/symbol`
+//! then `prepareCallHierarchy` / `incomingCalls`), so results are
+//! type-accurate. Supported: rust, python, typescript, go (see `--lang`).
+//! Failures are loud typed errors, never silent fallbacks.
 
 #![forbid(unsafe_code)]
 
@@ -13,27 +13,90 @@ mod lsp;
 mod harness;
 
 use deepfunc_core::{
-    caller_from_range, caller_from_text, parse_target, render_markdown, CallerEntry, CallerRef,
-    Error, Report,
+    caller_from_range, parse_target, render_markdown, CallerEntry, CallerRef, Error, Report,
 };
-use lsp::{uri_to_path, RaClient};
+use lsp::{innermost_callable, uri_to_path, LanguageClient};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+struct Language {
+    id: &'static str,
+    language_id: &'static str,
+    server_cmd: &'static [&'static str],
+    markers: &'static [&'static str],
+    extensions: &'static [&'static str],
+    install_hint: &'static str,
+    /// Set when the path is wired but verified broken: fail loudly (E08)
+    /// instead of returning guesses. Remove when the server is fixed.
+    broken: Option<&'static str>,
+}
+
+const LANGUAGES: &[Language] = &[
+    Language {
+        id: "rust",
+        language_id: "rust",
+        server_cmd: &["rust-analyzer"],
+        markers: &["Cargo.toml"],
+        extensions: &["rs"],
+        install_hint: "rustup component add rust-analyzer, or nix-shell -p rust-analyzer",
+        broken: None,
+    },
+    Language {
+        id: "python",
+        language_id: "python",
+        server_cmd: &["pyright-langserver", "--stdio"],
+        markers: &["pyproject.toml", "setup.py", "setup.cfg"],
+        extensions: &["py"],
+        install_hint: "nix-shell -p pyright",
+        broken: None,
+    },
+    Language {
+        id: "typescript",
+        language_id: "typescript",
+        server_cmd: &["typescript-language-server", "--stdio"],
+        markers: &["package.json", "tsconfig.json"],
+        extensions: &["ts", "tsx"],
+        install_hint: "nix-shell -p typescript-language-server",
+        broken: Some(
+            "typescript-language-server (5.3.0 and npm 6.0.0) never forwards tsserver-backed requests once a project loads: tsserver's own log shows a healthy configured project, but no navto/hover/prepare command ever arrives. Verified over ~15 raw protocol probes. Unblocks when a server version answers post-load requests; remove this flag then.",
+        ),
+    },
+    Language {
+        id: "go",
+        language_id: "go",
+        server_cmd: &["gopls"],
+        markers: &["go.mod"],
+        extensions: &["go"],
+        install_hint: "nix-shell -p gopls (also needs `go` on PATH)",
+        broken: None,
+    },
+];
+
+fn language(id: &str) -> Result<&'static Language, Error> {
+    match LANGUAGES.iter().find(|lang| lang.id == id) {
+        Some(lang) => Ok(lang),
+        None => Err(Error::BadTarget {
+            received: "unknown --lang `".to_owned()
+                + id
+                + "`. Supported: rust, python, typescript, go.",
+        }),
+    }
+}
 
 struct Args {
     project: PathBuf,
     target: String,
     out: Option<PathBuf>,
     fail_if_empty: bool,
-    scan: bool,
-    ra_bin: String,
+    lang: String,
+    server_bin: Option<String>,
     timeout_secs: u64,
 }
 
 fn usage() -> String {
-    "usage: deepfunc --project <dir> --target <path::to::fn|file.rs:line> [--out <file>] [--fail-if-empty] [--scan] [--ra-bin <path>] [--timeout <secs>]".to_owned()
+    "usage: deepfunc --project <dir> --target <path.to.fn|path::to::fn|file.ext:line> [--lang rust|python|typescript|go] [--out <file>] [--fail-if-empty] [--server-bin <path>] [--timeout <secs>]".to_owned()
 }
 
 fn parse_u64(raw: &str, flag: &str) -> Result<u64, Error> {
@@ -50,8 +113,8 @@ fn parse_args(argv: &[String]) -> Result<Args, Error> {
     let mut target: Option<String> = None;
     let mut out: Option<PathBuf> = None;
     let mut fail_if_empty = false;
-    let mut scan = false;
-    let mut ra_bin = "rust-analyzer".to_owned();
+    let mut lang = "rust".to_owned();
+    let mut server_bin: Option<String> = None;
     let mut timeout_secs: u64 = 120;
     let mut index = 1;
     while index < argv.len() {
@@ -89,13 +152,24 @@ fn parse_args(argv: &[String]) -> Result<Args, Error> {
                     }
                 }
             }
-            "--ra-bin" => {
+            "--lang" => {
                 index += 1;
                 match argv.get(index) {
-                    Some(value) => ra_bin = value.clone(),
+                    Some(value) => lang = value.clone(),
                     None => {
                         return Err(Error::BadTarget {
-                            received: "--ra-bin without a value".to_owned(),
+                            received: "--lang without a value".to_owned(),
+                        })
+                    }
+                }
+            }
+            "--server-bin" => {
+                index += 1;
+                match argv.get(index) {
+                    Some(value) => server_bin = Some(value.clone()),
+                    None => {
+                        return Err(Error::BadTarget {
+                            received: "--server-bin without a value".to_owned(),
                         })
                     }
                 }
@@ -112,7 +186,6 @@ fn parse_args(argv: &[String]) -> Result<Args, Error> {
                 }
             }
             "--fail-if-empty" => fail_if_empty = true,
-            "--scan" => scan = true,
             "--help" | "-h" => {
                 return Err(Error::BadTarget {
                     received: "help requested. ".to_owned() + &usage(),
@@ -132,8 +205,8 @@ fn parse_args(argv: &[String]) -> Result<Args, Error> {
             target,
             out,
             fail_if_empty,
-            scan,
-            ra_bin,
+            lang,
+            server_bin,
             timeout_secs,
         }),
         _ => Err(Error::BadTarget {
@@ -142,8 +215,9 @@ fn parse_args(argv: &[String]) -> Result<Args, Error> {
     }
 }
 
-/// Walk up from `start` until a directory containing Cargo.toml is found.
-fn find_workspace_root(start: &Path) -> Result<PathBuf, Error> {
+/// Walk up from `start` until a directory containing one of `markers` is found.
+fn find_workspace_root(start: &Path, markers: &[&str]) -> Result<PathBuf, Error> {
+    let marker_names: Vec<String> = markers.iter().map(|marker| marker.to_string()).collect();
     let mut current: PathBuf = if start.is_absolute() {
         start.to_path_buf()
     } else {
@@ -164,16 +238,17 @@ fn find_workspace_root(start: &Path) -> Result<PathBuf, Error> {
                 return Err(Error::WorkspaceNotFound {
                     start_dir: start.display().to_string(),
                     depth: 0,
+                    markers: marker_names,
                 })
             }
         }
     }
     let mut depth: u32 = 0;
     loop {
-        if current.join("Cargo.toml").is_file() {
+        if markers.iter().any(|marker| current.join(marker).is_file()) {
             // Lexical clean: `cwd.join(".")` leaves a trailing `/.`,
-            // which poisons hand-built `file://` URIs (RA matches no
-            // document). Components collection drops `.` segments.
+            // which poisons hand-built `file://` URIs (the server matches
+            // no document). Components collection drops `.` segments.
             return Ok(current.components().collect());
         }
         match current.parent() {
@@ -184,6 +259,7 @@ fn find_workspace_root(start: &Path) -> Result<PathBuf, Error> {
                     return Err(Error::WorkspaceNotFound {
                         start_dir: start.display().to_string(),
                         depth,
+                        markers: marker_names,
                     });
                 }
             }
@@ -191,6 +267,7 @@ fn find_workspace_root(start: &Path) -> Result<PathBuf, Error> {
                 return Err(Error::WorkspaceNotFound {
                     start_dir: start.display().to_string(),
                     depth,
+                    markers: marker_names,
                 })
             }
         }
@@ -215,126 +292,65 @@ fn display_path(root: &Path, absolute: &Path) -> String {
     }
 }
 
-fn collect_rs_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), Error> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return Err(Error::Io {
-                path: root.display().to_string(),
-                message: error.to_string(),
-            })
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                return Err(Error::Io {
-                    path: root.display().to_string(),
-                    message: error.to_string(),
-                })
-            }
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name == "target" || name == ".git" {
-                continue;
-            }
-            collect_rs_files(&path, files)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// Last path segment of `crate::mod::func` — the identifier to search for.
+/// Last segment of `a::b::func` or `a.b.func` — the identifier to search for.
 fn target_ident(target: &str) -> String {
-    match target.rsplit("::").next() {
-        Some(ident) => ident.to_owned(),
-        None => target.to_owned(),
-    }
+    target
+        .replace("::", ".")
+        .rsplit('.')
+        .next()
+        .unwrap_or(target)
+        .to_owned()
 }
 
-fn scan_workspace(root: &Path, target: &str) -> Result<Vec<CallerEntry>, Error> {
-    let mut files = Vec::new();
-    collect_rs_files(root, &mut files)?;
-    let ident = target_ident(target);
-    let needle = ident.clone() + "(";
-    let mut depth1: Vec<CallerEntry> = Vec::new();
-    for path in &files {
-        let text = read_file(path)?;
-        let relative = display_path(root, path);
-        let lines: Vec<&str> = text.lines().collect();
-        for (line_idx, line) in lines.iter().enumerate() {
-            if !line.contains(needle.as_str()) {
-                continue;
-            }
-            let start = match deepfunc_core::enclosing_fn_start0(&lines, line_idx) {
-                Some(start) => start,
-                None => continue,
-            };
-            let (body, _) = deepfunc_core::fn_block(&lines, start);
-            // Skip the target's own definition line matching itself.
-            if body.contains(&("fn ".to_owned() + &ident + "(")) && start == line_idx {
-                continue;
-            }
-            let caller = match caller_from_text(&text, &relative, (start + 1) as u32) {
-                Some(caller) => caller,
-                None => continue,
-            };
-            // Depth 2 via second scan for the depth-1 caller name (signature refs only).
-            let mut called_by: Vec<CallerRef> = Vec::new();
-            let caller_needle = caller.name.clone() + "(";
-            for other in &files {
-                if other == path {
-                    continue;
+/// First source file under `root` matching `extensions`, skipping
+/// dependency and build directories. Used as a seed `didOpen`: some
+/// servers (notably tsserver) only build their project model once a file
+/// is open, and answer `workspace/symbol` with errors before that.
+fn seed_file(root: &Path, extensions: &[&str]) -> Option<PathBuf> {
+    const SKIP: &[&str] = &[
+        "node_modules",
+        "target",
+        ".git",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+        ".tox",
+    ];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        // Collect first to keep traversal deterministic.
+        let mut entries: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !SKIP.contains(&name) {
+                    stack.push(path);
                 }
-                let other_text = match fs::read_to_string(other) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let other_rel = display_path(root, other);
-                let other_lines: Vec<&str> = other_text.lines().collect();
-                for (other_idx, other_line) in other_lines.iter().enumerate() {
-                    if !other_line.contains(caller_needle.as_str()) {
-                        continue;
-                    }
-                    if let Some(child) =
-                        caller_from_text(&other_text, &other_rel, (other_idx + 1) as u32)
-                    {
-                        called_by.push(CallerRef {
-                            name: child.name,
-                            file: child.file,
-                            line: (other_idx + 1) as u32,
-                            signature: child.signature,
-                        });
-                    }
-                    if called_by.len() >= 10 {
-                        break;
-                    }
-                }
-                if called_by.len() >= 10 {
-                    break;
-                }
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
+            {
+                return Some(path);
             }
-            depth1.push(CallerEntry { caller, called_by });
-            if depth1.len() >= 25 {
-                break;
-            }
-        }
-        if depth1.len() >= 25 {
-            break;
         }
     }
-    Ok(depth1)
+    None
 }
 
-/// Resolve `file.rs:line` targets to (absolute path, 0-based line).
+/// Resolve `file.ext:line` targets to (absolute path, 0-based line).
+/// Any extension: the language comes from `--lang`, not the suffix.
 fn parse_file_line(root: &Path, target: &str) -> Option<(PathBuf, u32)> {
     let (path, line) = target.rsplit_once(':')?;
-    if !path.ends_with(".rs") || line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
+    if !path.contains('.') || line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let number: u32 = match line.parse() {
@@ -347,91 +363,70 @@ fn parse_file_line(root: &Path, target: &str) -> Option<(PathBuf, u32)> {
     Some((root.join(path), number - 1))
 }
 
-/// Function name nearest 0-based `line0`: the signature on the line itself,
-/// else the first signature below (doc comments, attributes), else the
-/// nearest signature above (body positions). Returns `None` when no
-/// signature is nearby (module scope, imports).
-fn fn_name_near(text: &str, line0: u32) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let origin = (line0 as usize).min(lines.len() - 1);
-    let mut below = origin;
-    while below < lines.len() && below < origin + 8 {
-        if let Some(name) = fn_name_on_line(lines[below]) {
-            return Some(name);
-        }
-        // Stop descending past an opening brace: we entered a body.
-        if lines[below].contains('{') {
-            break;
-        }
-        below += 1;
-    }
-    let mut above = origin;
-    loop {
-        if let Some(name) = fn_name_on_line(lines[above]) {
-            return Some(name);
-        }
-        if above == 0 {
-            return None;
-        }
-        above -= 1;
-    }
-}
-
-/// Function name when `line` is a signature line, else `None`.
-fn fn_name_on_line(line: &str) -> Option<String> {
-    let pos = line.find("fn ")?;
-    let rest = &line[pos + 3..];
-    let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
-    let name = rest[..end].trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_owned())
-}
-
 fn lsp_workspace(
     root: &Path,
     target: &str,
-    ra_bin: &str,
+    lang: &Language,
+    server_bin: Option<&str>,
     timeout_secs: u64,
 ) -> Result<Vec<CallerEntry>, Error> {
-    let mut client = RaClient::spawn(ra_bin, root, timeout_secs)?;
+    let program = server_bin.unwrap_or(lang.server_cmd[0]);
+    // A --server-bin override replaces the program but keeps the table args
+    // (e.g. pyright still needs --stdio).
+    let extra: Vec<String> = lang.server_cmd[1..]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let mut client = LanguageClient::spawn(
+        program,
+        &extra,
+        root,
+        timeout_secs,
+        lang.id,
+        lang.install_hint,
+    )?;
+    let result = lsp_inner(&mut client, root, target, lang);
+    if result.is_err() {
+        // Loud failure: show what the server volunteered (config errors,
+        // crash notices) alongside the typed error below.
+        for note in client.drain_notes() {
+            eprintln!("warning: [server] {note}");
+        }
+    }
+    Ok(result?)
+}
+
+fn lsp_inner(
+    client: &mut LanguageClient,
+    root: &Path,
+    target: &str,
+    lang: &Language,
+) -> Result<Vec<CallerEntry>, Error> {
     // Readiness first, lookup second. The canary gate waits for a loaded
-    // index; after it passes, empty answers mean genuinely unknown and
-    // resolve fast instead of burning full retry budgets.
+    // index; after it passes, empty answers mean genuinely unknown.
+    // Seed one open file first: some servers need it before the project
+    // model (and therefore symbol search) exists at all.
+    if let Some(seed) = seed_file(root, lang.extensions) {
+        if let Ok(text) = fs::read_to_string(&seed) {
+            let uri = format!("file://{}", seed.display());
+            client.did_open(&uri, lang.language_id, &text);
+        }
+    }
     client.ensure_index_ready();
     // Resolve the target to one hierarchy item.
     let (uri, line0, character) = if let Some((path, line0)) = parse_file_line(root, target) {
         let text = read_file(&path)?;
         let uri = format!("file://{}", path.display());
-        client.did_open(&uri, &text);
-        // rust-analyzer `prepareCallHierarchy` resolves identifier
-        // positions reliably but NOT arbitrary body positions (verified:
-        // mid-body returns []). So map file:line to a name locally, then
-        // reuse the symbol path filtered to this file.
-        let name = fn_name_near(&text, line0).ok_or_else(|| Error::TargetNotFound {
-            target: target.to_owned(),
-            workspace: root.display().to_string(),
-        })?;
-        let symbols = client.workspace_symbols(&name)?;
-        let wanted_tail = path.display().to_string();
-        let mut picked: Option<(String, u32, u32)> = None;
-        for symbol in &symbols {
-            if symbol.name() != name {
-                continue;
+        client.did_open(&uri, lang.language_id, &text);
+        // Servers resolve identifier positions reliably but NOT arbitrary
+        // body positions (verified: mid-body returns []). Map file:line to
+        // the enclosing symbol via documentSymbol, then reuse that position.
+        let symbols = client.document_symbols(&uri)?;
+        match innermost_callable(&symbols, line0) {
+            Some(symbol) => {
+                let (sel_line, sel_char) = symbol.sel_pos0();
+                (uri, sel_line, sel_char)
             }
-            if uri_to_path(symbol.uri()).as_deref() == Some(wanted_tail.as_str())
-                || symbol.uri() == uri
-            {
-                picked = Some((symbol.uri().to_owned(), symbol.line0(), symbol.char0()));
-                break;
-            }
-        }
-        match picked {
-            Some(entry) => entry,
             None => {
                 return Err(Error::TargetNotFound {
                     target: target.to_owned(),
@@ -441,7 +436,8 @@ fn lsp_workspace(
         }
     } else {
         let ident = target_ident(target);
-        let parents: Vec<&str> = target.split("::").collect();
+        let normalized = target.replace("::", ".");
+        let parents: Vec<&str> = normalized.split('.').collect();
         let parent = if parents.len() > 1 {
             parents[parents.len() - 2]
         } else {
@@ -475,7 +471,7 @@ fn lsp_workspace(
         match uri_to_path(&uri) {
             Some(path) => {
                 let text = read_file(Path::new(&path))?;
-                client.did_open(&uri, &text);
+                client.did_open(&uri, lang.language_id, &text);
             }
             None => {
                 return Err(Error::TargetNotFound {
@@ -503,7 +499,7 @@ fn lsp_workspace(
             None => continue,
         };
         let caller_text = read_file(Path::new(&caller_path))?;
-        client.did_open(&caller_uri, &caller_text);
+        client.did_open(&caller_uri, lang.language_id, &caller_text);
         let relative = display_path(root, Path::new(&caller_path));
         let (start0, end0) = call.from().def_span0();
         let caller = caller_from_range(&caller_text, &relative, call.from().name(), start0, end0);
@@ -525,9 +521,17 @@ fn lsp_workspace(
                         let sub_rel = display_path(root, Path::new(&sub_path));
                         let (sub_start, _) = sub_call.from().def_span0();
                         let sub_lines: Vec<&str> = sub_text.lines().collect();
-                        let signature = sub_lines
-                            .get(sub_start as usize)
-                            .map_or(String::new(), |line| line.trim().to_owned());
+                        // Module-scope callers have no signature: the call-site
+                        // line itself is the informative text.
+                        let signature = if sub_call.from().kind() == 2 {
+                            sub_lines
+                                .get(sub_call.call_line1().saturating_sub(1) as usize)
+                                .map_or(String::new(), |line| line.trim().to_owned())
+                        } else {
+                            sub_lines
+                                .get(sub_start as usize)
+                                .map_or(String::new(), |line| line.trim().to_owned())
+                        };
                         called_by.push(CallerRef {
                             name: sub_call.from().name().to_owned(),
                             file: sub_rel,
@@ -546,35 +550,22 @@ fn lsp_workspace(
 
 fn run(argv: &[String]) -> Result<String, Error> {
     let args = parse_args(argv)?;
+    let lang = language(&args.lang)?;
+    if let Some(reason) = lang.broken {
+        return Err(Error::Unsupported {
+            language: lang.id.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
     let target = parse_target(&args.target)?;
-    let root = find_workspace_root(&args.project)?;
-    let (depth1, engine_note) = if args.scan {
-        let depth1 = scan_workspace(&root, &target)?;
-        let note = "note: syntactic scan (`--scan`) — names matched textually, not type-resolved. Suspected false positives: methods with the same name in other impls.";
-        (depth1, note)
-    } else {
-        match lsp_workspace(&root, &target, &args.ra_bin, args.timeout_secs) {
-            Ok(depth1) => {
-                let note = "note: resolved by rust-analyzer (type-accurate call hierarchy).";
-                (depth1, note)
-            }
-            Err(error) => {
-                // E01 (no binary) and E06 (request failure) degrade to the
-                // scan with a clear warning instead of hard failing, unless
-                // the target itself is unknown (E04) or IO failed (E07).
-                match error {
-                    Error::RaNotFound { .. } | Error::RequestFailed { .. } => {
-                        eprintln!("{error}");
-                        eprintln!("warning: falling back to `--scan` (textual matching). Pass `--ra-bin` or raise `--timeout` for accurate results.");
-                        let depth1 = scan_workspace(&root, &target)?;
-                        let note = "note: SYNTACTIC FALLBACK — rust-analyzer failed (see warning above). Names matched textually; suspected false positives: same-name methods in other impls.";
-                        (depth1, note)
-                    }
-                    _ => return Err(error),
-                }
-            }
-        }
-    };
+    let root = find_workspace_root(&args.project, lang.markers)?;
+    let depth1 = lsp_workspace(
+        &root,
+        &target,
+        lang,
+        args.server_bin.as_deref(),
+        args.timeout_secs,
+    )?;
     let empty = depth1.is_empty();
     let report = Report {
         target: target.clone(),
@@ -583,9 +574,9 @@ fn run(argv: &[String]) -> Result<String, Error> {
         empty,
     };
     let mut markdown = render_markdown(&report);
-    markdown.push_str("\n---\n");
-    markdown.push_str(engine_note);
-    markdown.push('\n');
+    markdown.push_str("\n---\nnote: resolved by ");
+    markdown.push_str(lang.server_cmd[0]);
+    markdown.push_str(" (type-accurate call hierarchy).\n");
     if empty && args.fail_if_empty {
         return Err(Error::TargetNotFound {
             target,

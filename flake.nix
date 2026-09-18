@@ -21,6 +21,13 @@
           rustfmt
           clippy
           rust-analyzer
+          # deepFunc language servers (one per supported --lang)
+          gopls
+          pyright
+          typescript-language-server
+          # runtimes the servers need for workspace introspection
+          go
+          python3
           gcc
           git
           why3
