@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["deepfunc-core", "deepfunc-cli"]
+members = ["deepfunc-core", "deepfunc-cli", "deepfunc-mcp"]
 
 [workspace.package]
 version = "0.1.0"

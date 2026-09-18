@@ -1,0 +1,13 @@
+[package]
+name = "deepfunc-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

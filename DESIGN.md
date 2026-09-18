@@ -8,9 +8,10 @@ Out of scope: cross-language support, exact macro expansion, IDE integration.
 
 ## 2. Components
 
-Two crates: `deepfunc-core` (lib, pure call-graph logic + formatting) and `deepfunc-cli` (bin, rust-analyzer LSP driver + file IO).
-
-Core stays pure for testability. CLI owns LSP startup, workspace discovery, and output writing.
+Three crates: `deepfunc-core` (lib, pure call-graph logic + formatting),
+`deepfunc-cli` (bin, rust-analyzer LSP driver + file IO), `deepfunc-mcp`
+(bin, rmcp stdio server with one `callers` tool that shells out to the CLI
+via `DEEPFUNC_BIN`). Core stays pure. CLI owns LSP. MCP owns protocol.
 
 ## 3. Request flow
 
