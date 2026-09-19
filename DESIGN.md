@@ -39,6 +39,21 @@ No scan fallback exists by design: E01/E04/E06/E08 are loud errors.
 Server notifications (window/logMessage et al.) are captured and dumped
 to stderr on failure, so config errors surface with the typed error.
 
+## 2c. Provisioning (`deepfunc provision`)
+
+E01 fails loudly and points here. `provision --lang ID [--version V]
+[--dir D]` / `--all` downloads pinned servers into
+`~/.local/share/deepfunc/servers` (XDG-aware), smoke-verifies, writes a
+manifest, and prints the `--server-bin` path. Per-language truths:
+
+- rust: GitHub release asset (pinned tag, gunzip) + `--version` smoke.
+  NixOS refuses generic-linux binaries (stub-ld): provision detects it
+  and fails LOUDLY toward nix instead of wasting a 40MB download.
+- go: `go install gopls@pin` (needs `go`; natively NixOS-clean).
+- python/typescript: `npm install --prefix` (npm verifies integrity;
+  executable-bit check only — these servers have no version flag).
+- Manifest per language records exact version for later audits.
+
 ## 3. Request flow
 
 CLI resolves target via `textDocument/prepareCallHierarchy`. Then it requests `callHierarchy/incomingCalls` for depth 1, repeats once for depth 2. Core formats the tree into markdown with file:line headers.

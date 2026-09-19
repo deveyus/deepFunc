@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod lsp;
+mod provision;
 
 #[cfg(kani)]
 mod harness;
@@ -599,6 +600,25 @@ fn run(argv: &[String]) -> Result<String, Error> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = env::args().collect();
+    if argv.get(1).is_some_and(|first| first == "provision") {
+        return match run_provision(&argv) {
+            Ok(reports) => {
+                for report in &reports {
+                    println!("provisioned {} {}", report.language, report.version);
+                    println!("binary: {}", report.program);
+                    println!(
+                        "use with: deepfunc --lang {} --server-bin {}",
+                        report.language, report.program
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&argv) {
         Ok(markdown) => {
             print!("{markdown}");
@@ -609,4 +629,100 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `deepfunc provision [--lang ID]... [--all] [--version V] [--dir D]`.
+/// Downloads language servers; fails loudly per language, continues with
+/// the rest, exits non-zero if any failed.
+fn run_provision(argv: &[String]) -> Result<Vec<provision::ProvisionReport>, Error> {
+    let mut langs: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut version: Option<String> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut index = 2;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--lang" => {
+                index += 1;
+                match argv.get(index) {
+                    Some(value) => langs.push(value.clone()),
+                    None => {
+                        return Err(Error::BadTarget {
+                            received: "--lang without a value".to_owned(),
+                        })
+                    }
+                }
+            }
+            "--all" => all = true,
+            "--version" => {
+                index += 1;
+                match argv.get(index) {
+                    Some(value) => version = Some(value.clone()),
+                    None => {
+                        return Err(Error::BadTarget {
+                            received: "--version without a value".to_owned(),
+                        })
+                    }
+                }
+            }
+            "--dir" => {
+                index += 1;
+                match argv.get(index) {
+                    Some(value) => dir = Some(PathBuf::from(value)),
+                    None => {
+                        return Err(Error::BadTarget {
+                            received: "--dir without a value".to_owned(),
+                        })
+                    }
+                }
+            }
+            other => return Err(Error::BadTarget {
+                received: "unknown provision flag `".to_owned()
+                    + other
+                    + "`. usage: deepfunc provision [--lang ID]... [--all] [--version V] [--dir D]",
+            }),
+        }
+        index += 1;
+    }
+    if all {
+        langs = vec![
+            "rust".to_owned(),
+            "python".to_owned(),
+            "typescript".to_owned(),
+            "go".to_owned(),
+        ];
+    }
+    if langs.is_empty() {
+        return Err(Error::BadTarget {
+            received: "provision needs --lang ID or --all".to_owned(),
+        });
+    }
+    let root = match dir {
+        Some(dir) => dir,
+        None => provision::default_servers_dir()?,
+    };
+    let mut reports = Vec::new();
+    let mut failures = 0;
+    for lang in &langs {
+        match provision::provision(lang, version.as_deref(), None, &root) {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                eprintln!("{error}");
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(Error::Io {
+            path: "provision".to_owned(),
+            message: failures.to_string() + " language(s) failed (see errors above)",
+        });
+    }
+    if reports.is_empty() {
+        return Err(Error::Io {
+            path: "provision".to_owned(),
+            message: "nothing provisioned".to_owned(),
+        });
+    }
+    Ok(reports)
 }

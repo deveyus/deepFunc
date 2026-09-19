@@ -66,7 +66,7 @@ impl Display for Error {
                 install_hint,
             } => write!(
                 f,
-                "error[E01]: language server not found\n --> language: {language}\n  |\n  | note: could not start `{server}` ({detail})\n  | help: install it: {install_hint}\n  | help: or pass `--server-bin /path/to/server`"
+                "error[E01]: language server not found\n --> language: {language}\n  |\n  | note: could not start `{server}` ({detail})\n  | help: install it: {install_hint}\n  | help: or run `deepfunc provision --lang {language}` to download it"
             ),
             Self::WorkspaceNotFound {
                 start_dir,

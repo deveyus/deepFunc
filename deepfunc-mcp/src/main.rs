@@ -96,6 +96,49 @@ impl DeepFuncMcp {
             )),
         }
     }
+
+    /// Download a language server when E01 says it is missing. SLOW
+    /// (minutes for first downloads): raise the client MCP timeout.
+    #[tool(
+        description = "Download a language server (rust|python|typescript|go) into a directory. Params: lang, version (optional pin override), dir (optional servers root). Prints the binary path; use it with callers via --server-bin. SLOW minutes on first download: raise client mcp_timeout."
+    )]
+    async fn provision(
+        &self,
+        Parameters(req): Parameters<ProvisionReq>,
+    ) -> Result<Json<String>, ErrorData> {
+        let bin = self.bin.clone();
+        let mut args = vec!["provision".to_owned(), "--lang".to_owned(), req.lang];
+        if let Some(version) = req.version {
+            args.push("--version".to_owned());
+            args.push(version);
+        }
+        if let Some(dir) = req.dir {
+            args.push("--dir".to_owned());
+            args.push(dir);
+        }
+        let worker = tokio::task::spawn_blocking(move || run_cli(&bin, &args));
+        match tokio::time::timeout(Duration::from_secs(900), worker).await {
+            Ok(joined) => match joined {
+                Ok(result) => result.map(Json),
+                Err(error) => Err(fail(
+                    "deepfunc worker failed: ".to_owned() + &error.to_string(),
+                )),
+            },
+            Err(_) => Err(fail(
+                "provision timed out after 900s. Retry; downloads resume partially (npm/go caches, rerun overwrites).".to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProvisionReq {
+    /// Language server to download: rust, python, typescript, go.
+    pub lang: String,
+    /// Pinned version override (defaults per language, see DESIGN.md).
+    pub version: Option<String>,
+    /// Servers root override (default ~/.local/share/deepfunc/servers).
+    pub dir: Option<String>,
 }
 
 #[tokio::main]
