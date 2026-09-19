@@ -704,7 +704,7 @@ fn run_provision(argv: &[String]) -> Result<Vec<provision::ProvisionReport>, Err
     let mut reports = Vec::new();
     let mut failures = 0;
     for lang in &langs {
-        match provision::provision(lang, version.as_deref(), None, &root) {
+        match provision::provision(lang, version.as_deref(), &root) {
             Ok(report) => reports.push(report),
             Err(error) => {
                 eprintln!("{error}");

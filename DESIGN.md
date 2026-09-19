@@ -42,17 +42,23 @@ to stderr on failure, so config errors surface with the typed error.
 ## 2c. Provisioning (`deepfunc provision`)
 
 E01 fails loudly and points here. `provision --lang ID [--version V]
-[--dir D]` / `--all` downloads pinned servers into
-`~/.local/share/deepfunc/servers` (XDG-aware), smoke-verifies, writes a
-manifest, and prints the `--server-bin` path. Per-language truths:
+[--dir D]` / `--all` downloads pinned servers with NO helper tools
+installed (no go/npm/pip/curl dependency — pure Rust: ureq, flate2+tar,
+lzma-rs+tar, sha2/sha1+hex). Hashes verify against authoritative
+metadata (npm shasum, go.dev sha256, nodejs SHASUMS256); rust-analyzer
+has no published checksums (TLS-only, stated in code). Each install
+writes a manifest and prints the `--server-bin` path:
 
 - rust: GitHub release asset (pinned tag, gunzip) + `--version` smoke.
   NixOS refuses generic-linux binaries (stub-ld): provision detects it
   and fails LOUDLY toward nix instead of wasting a 40MB download.
-- go: `go install gopls@pin` (needs `go`; natively NixOS-clean).
-- python/typescript: `npm install --prefix` (npm verifies integrity;
-  executable-bit check only — these servers have no version flag).
-- Manifest per language records exact version for later audits.
+- go: toolchain tarball (pinned, sha256) → `go install gopls@pin` with
+  the provisioned toolchain → wrapper pinning GOROOT+PATH (gopls shells
+  out to `go list` at serve time, when no Go is around).
+- python/typescript: npm registry tarballs (shasum) unpacked natively;
+  bin entry resolved from package.json; run under a shared provisioned
+  node (or system node on NixOS, where nodejs.org binaries cannot
+  execute) via a generated wrapper script.
 
 ## 3. Request flow
 
