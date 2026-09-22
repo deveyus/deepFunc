@@ -39,7 +39,20 @@ No scan fallback exists by design: E01/E04/E06/E08 are loud errors.
 Server notifications (window/logMessage et al.) are captured and dumped
 to stderr on failure, so config errors surface with the typed error.
 
-## 2c. Provisioning (`deepfunc provision`)
+## 2c. Deployment (dev/prod split)
+
+Development lives in this repo (flake devshell, cargo, gate).
+Production is `~/mcp/deepfunc/`, assembled by `dev-scripts/deploy.sh`
+(build release, copy binaries, stamp VERSION, gc-root rust-analyzer):
+`run.sh` execs in milliseconds with no nix involved, so MCP tool
+registration (5s default fetch timeout) never races a devshell.
+
+At serve time the CLI resolves each language server in order:
+`--server-bin`, table program on PATH, provisioned manifest. `run.sh`
+sets only PATH (for the gc-rooted rust-analyzer) and DEEPFUNC_BIN;
+everything else self-resolves, including provisioned copies.
+
+## 2d. Provisioning (`deepfunc provision`)
 
 E01 fails loudly and points here. `provision --lang ID [--version V]
 [--dir D]` / `--all` downloads pinned servers with NO helper tools

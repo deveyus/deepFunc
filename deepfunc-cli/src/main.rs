@@ -371,15 +371,59 @@ fn lsp_workspace(
     server_bin: Option<&str>,
     timeout_secs: u64,
 ) -> Result<Vec<CallerEntry>, Error> {
-    let program = server_bin.unwrap_or(lang.server_cmd[0]);
-    // A --server-bin override replaces the program but keeps the table args
-    // (e.g. pyright still needs --stdio).
-    let extra: Vec<String> = lang.server_cmd[1..]
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
+    // Server resolution, in order (E01 only when all miss):
+    // - `--server-bin "program [args...]"` (whitespace-split; no spaces
+    //   in server paths): explicit and complete, e.g. provision wrappers.
+    // - table program on PATH, plus table args.
+    // - previously provisioned manifest (complete wrapper command).
+    let (program, extra): (String, Vec<String>) = match server_bin {
+        Some(cmdline) => {
+            let mut parts = cmdline.split_whitespace();
+            match parts.next() {
+                Some(program) => (
+                    program.to_owned(),
+                    parts.map(|arg| arg.to_owned()).collect(),
+                ),
+                None => {
+                    return Err(Error::BadTarget {
+                        received: "--server-bin without a value".to_owned(),
+                    })
+                }
+            }
+        }
+        None => {
+            let table_program = lang.server_cmd[0].to_owned();
+            let on_path = std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join(&table_program).is_file())
+            });
+            if on_path {
+                (
+                    table_program,
+                    lang.server_cmd[1..]
+                        .iter()
+                        .map(|arg| arg.to_string())
+                        .collect(),
+                )
+            } else {
+                match provision::default_servers_dir()
+                    .ok()
+                    .and_then(|root| provision::manifest_server(&root, lang.id))
+                {
+                    Some((program, _)) => (program, Vec::new()),
+                    None => {
+                        return Err(Error::ServerNotFound {
+                            language: lang.id.to_owned(),
+                            server: lang.server_cmd.join(" "),
+                            detail: "not on PATH and no provisioned copy".to_owned(),
+                            install_hint: lang.install_hint.to_owned(),
+                        })
+                    }
+                }
+            }
+        }
+    };
     let mut client = LanguageClient::spawn(
-        program,
+        &program,
         &extra,
         root,
         timeout_secs,

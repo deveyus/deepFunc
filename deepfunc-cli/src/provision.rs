@@ -765,6 +765,19 @@ fn provision_go(root: &Path, version: &str, gopls_version: &str) -> Result<Provi
     })
 }
 
+/// Resolve a previously provisioned server: (program, table args stay
+/// with the caller). Returns None when no manifest exists. A corrupt
+/// manifest is ignored (fresh provision overwrites it).
+pub fn manifest_server(root: &Path, lang_id: &str) -> Option<(String, Vec<String>)> {
+    let text = std::fs::read_to_string(root.join(lang_id).join("manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let program = manifest.get("program")?.as_str()?.to_owned();
+    if program.is_empty() || !Path::new(&program).is_file() {
+        return None;
+    }
+    Some((program, Vec::new()))
+}
+
 /// Provision one language server. `version_override` replaces the pinned
 /// default. `root` is the servers root (each language gets a subdir).
 pub fn provision(
