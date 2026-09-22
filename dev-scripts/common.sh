@@ -1,4 +1,4 @@
-# Shared setup for keyServ dev-scripts. Sourced, never executed.
+# Shared setup for deepFunc dev-scripts. Sourced, never executed.
 #
 # Each script starts:
 #   #!/usr/bin/env bash

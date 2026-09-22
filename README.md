@@ -1,46 +1,124 @@
-# Template — Rust Template
+# deepFunc
 
-A strict, batteries-included Rust workspace. Nix flake, formal verification, deterministic benches, and a one-shot init.
-
-## Quick start
+Give an LLM exactly the calling context it needs — no more, no less.
+deepFunc takes a function in a Rust, Python, or Go workspace, walks the
+language server's call hierarchy two levels up, and emits one markdown
+document: **full bodies at depth 1, signatures at depth 2.**
 
 ```bash
-# clone as your new project
-git clone file:///home/serafina/dev/rust-template myapp
-cd myapp
+deepfunc --project ~/src/myapp --lang rust --target 'crate::net::dial'
+```
 
-# stamp project name, author, year, description (idempotent, dry-run first)
-dev-scripts/init.sh --dry-run --project myapp --title MyApp --author "Your Name" --year 2026
-dev-scripts/init.sh --project myapp --title MyApp --author "Your Name" --author "Your Name" --email you@example.com
+````markdown
+# deepFunc: `crate::net::dial`
 
-# enter devShell and verify
+## crate::ui::connect (src/ui.rs:41-48)
+
+```rust
+pub fn connect(addr: &str) {
+    dial(addr);
+}
+```
+
+callers of `crate::ui::connect` (depth 2, signatures):
+
+- `crate::main::main` (src/main.rs:12) — `fn main()`
+````
+
+## Status
+
+| Language   | Server                   | State                              |
+|------------|--------------------------|------------------------------------|
+| Rust       | rust-analyzer            | Full bodies at depth 1             |
+| Python     | pyright                  | Full graph; module-scope callers show the call line |
+| Go         | gopls                    | Full graph; declaration-line spans |
+| TypeScript | typescript-language-server | Blocked (E08): the server never answers post-load requests |
+
+C++ is not planned.
+
+## Install
+
+No helpers required — no `go`, `npm`, or `curl` needed. deepFunc
+downloads everything itself, hash-verified:
+
+```bash
+cargo build --release -p deepfunc-cli
+./target/release/deepfunc-cli provision --all
+```
+
+This installs pinned language servers into `~/.local/share/deepfunc/servers`
+(plus a shared node runtime for the JS servers). On NixOS, rust-analyzer
+cannot run as a generic-linux binary, so provision points you at nix
+instead of wasting the download. See `DESIGN.md` §2d for sources and pins.
+
+For development (linted, verified, benchmarked), use the Nix flake:
+
+```bash
 nix develop . --command bash dev-scripts/gate.sh
 ```
 
-`init.sh` is idempotent and resumable. It stamps `Cargo.toml` (workspace + crates), `flake.nix` description, `LICENSE` copyright, `DESIGN.md` title, `AGENTS.md` board, and `src` headers. It also ensures `cargo-llvm-cov`, `cargo-fuzz`, `iai-callgrind-runner`, `why3`, `z3`, `cbmc`, `steam-run`, `kani`, and `creusot` are present.
+## Usage
 
-## What you get
+```bash
+# Dotted or double-colon paths
+deepfunc --project . --lang python --target 'pkg.mod.connect'
+deepfunc --project . --lang rust --target 'crate::net::dial'
 
-- **Workspace** `template-core` (lib) + `template-exec` (bin) — rename via `init.sh`
-- **Lints** `#![forbid(unsafe_code)]`, `unwrap_used/expect_used/panic = deny`, `no-panic` checked in `tests/no_panic.rs`
-- **Verification** Creusot `creusot-std 2a1bc72` for pure logic, Kani `0.67` for IO seams via `steam-run` FHS (NixOS stub-ld fix), `why3/z3` in flake
-- **Perf** `iai-callgrind 0.16` `Ir` counts, baselines under `target/iai/`
-- **Fuzz** `cargo-fuzz` 60s per target
-- **Gate** `dev-scripts/gate.sh` aggregates `check, clippy, fmt --check, test, test-release, coverage, verify`
-- **Docs** `TEST_METHODOLOGY.md` + `TEST_TEMPLATE_A/B/C.md` copied from `furnace` in-repo (see `AGENTS.md: Testing`)
+# File:line targets (any position in or near the function)
+deepfunc --project . --lang go --target 'main.go:9'
 
-## Kani on NixOS
+# Write to a file, fail CI-style when nothing calls it
+deepfunc --project . --target 'crate::dead::code' --out ctx.md --fail-if-empty
 
-Kani hardcodes FHS glibc paths and hits the stub-ld even after local `cargo install`. This template mirrors `furnace/shell.nix`: `flake.nix` adds `pkgs.steam-run + pkgs.cbmc` (`allowUnfree`), `verify.sh` probes `TMPDIR=/tmp steam-run cargo kani` first. Do not `patchelf` `~/.cargo/bin`. See `dev-scripts/init.sh` and `dev-scripts/verify.sh` comments.
+# Override the server binary (provision wrappers carry their own args)
+deepfunc --project . --lang python --server-bin /path/to/pyright-langserver --stdio
+```
 
-## Creusot
+## MCP
 
-`cargo-creusot` is installed via `cargo install --git https://github.com/creusot-rs/creusot`. Its toolchain lives at `~/.local/share/creusot` and needs `cargo creusot setup install` (800 MB) + `why3 config detect`.
+deepFunc ships an MCP server (`deepfunc-mcp`, tools `callers` +
+`provision`) for agents. With opencode:
 
-## Template philosophy
+```json
+{
+  "mcp": {
+    "deepfunc": {
+      "type": "local",
+      "command": ["~/mcp/deepfunc/run.sh"],
+      "enabled": true
+    }
+  }
+}
+```
 
-`DESIGN.md` is authoritative, `AGENTS.md` is the workflow guide. Keep `dev-scripts/` honest. `init.sh` is the only file that knows about `Template → YourProject` renaming.
+See `dev-scripts/deploy.sh` for the dev/prod split that
+keeps server startup in milliseconds. Cold calls take 30–60s for language
+server load — raise the client MCP timeout (`experimental.mcp_timeout`)
+if calls time out.
+
+## Errors
+
+Failures are typed, stable, and rustc-shaped: what went wrong, the
+evidence (`note:`), and the suspected fix first (`help:`). No silent
+fallbacks — a wrong answer is worse than none.
+
+| Code | Meaning |
+|------|---------|
+| E01  | Language server missing (`deepfunc provision --lang …`) |
+| E02  | No workspace marker walking up from `--project` |
+| E03  | Bad target or flag syntax |
+| E04  | Target not found after the readiness wait |
+| E06  | Server request failed or timed out |
+| E07  | Filesystem failure with path context |
+| E08  | Language wired but known-broken |
+
+## Development
+
+`DESIGN.md` is authoritative; `AGENTS.md` is the workflow guide.
+Three crates: `deepfunc-core` (pure logic), `deepfunc-cli` (LSP driver),
+`deepfunc-mcp` (rmcp stdio server). No panics, no unsafe, workspace lints
+deny both.
 
 ## License
 
-LGPL-3.0-or-later. See `LICENSE`. `init.sh` stamps your name/year there.
+LGPL-3.0-or-later. See `LICENSE`.

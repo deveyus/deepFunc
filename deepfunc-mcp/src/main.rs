@@ -25,7 +25,7 @@ pub struct DeepFuncMcp {
     bin: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct CallersReq {
     /// Workspace directory (or subdir) containing the project marker.
     pub project: String,
@@ -157,7 +157,7 @@ impl DeepFuncMcp {
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ProvisionReq {
     /// Language server to download: rust, python, typescript, go.
     pub lang: String,
@@ -182,5 +182,76 @@ async fn main() {
     if let Err(error) = server.waiting().await {
         eprintln!("deepfunc-mcp exited: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{into_tool_result, run_cli, CliOutcome};
+    use rmcp::model::CallToolResult;
+
+    fn is_error(result: &CallToolResult) -> bool {
+        result.is_error.unwrap_or(false)
+    }
+
+    #[test]
+    fn run_cli_reports_all_three_outcomes() {
+        // Success: stdout passes through (/bin/sh always exists, even on
+        // NixOS where /bin holds nothing else).
+        let ok = run_cli("/bin/sh", &["-c".to_owned(), "echo hi".to_owned()]);
+        assert!(ok.is_ok());
+        if let Ok(text) = ok {
+            assert!(text.contains("hi"));
+        }
+        // Tool error: non-zero exit surfaces stderr.
+        let failed = run_cli(
+            "/bin/sh",
+            &["-c".to_owned(), "echo oops >&2; exit 3".to_owned()],
+        );
+        assert!(matches!(failed, Err(CliOutcome::ToolError(_))));
+        if let Err(CliOutcome::ToolError(message)) = failed {
+            assert!(message.contains("oops"));
+        }
+        // Infra error: missing binary.
+        let missing = run_cli("/nonexistent-deepfunc-test-binary", &[]);
+        assert!(matches!(missing, Err(CliOutcome::InfraError(_))));
+        if let Err(CliOutcome::InfraError(message)) = missing {
+            assert!(message.contains("DEEPFUNC_BIN"));
+        }
+    }
+
+    #[test]
+    fn into_tool_result_maps_shapes() {
+        let ok = into_tool_result(Ok("report".to_owned()));
+        assert!(ok.is_ok());
+        if let Ok(result) = ok {
+            assert!(!is_error(&result));
+            assert_eq!(result.content.len(), 1);
+            assert!(result.structured_content.is_none());
+        }
+        let tool_err = into_tool_result(Err(CliOutcome::ToolError("E04 ...".to_owned())));
+        assert!(tool_err.is_ok());
+        if let Ok(result) = tool_err {
+            assert!(is_error(&result));
+            assert!(result.structured_content.is_none());
+        }
+        assert!(into_tool_result(Err(CliOutcome::InfraError("x".to_owned()))).is_err());
+    }
+
+    #[test]
+    fn request_shapes_deserialize() {
+        let callers: super::CallersReq =
+            serde_json::from_str(r#"{"project":".","target":"a::b"}"#).unwrap_or_default();
+        assert_eq!(callers.project, ".");
+        assert!(callers.lang.is_none());
+        let provision: super::ProvisionReq =
+            serde_json::from_str(r#"{"lang":"go","timeout_secs":1}"#).unwrap_or_default();
+        assert_eq!(provision.lang, "go");
+        // Unknown fields are tolerated (client forwards extras).
+        let extra: super::CallersReq = serde_json::from_str(
+            r#"{"project":".","target":"a","lang":"rust","timeout_secs":30,"scan":true}"#,
+        )
+        .unwrap_or_default();
+        assert_eq!(extra.timeout_secs, Some(30));
     }
 }

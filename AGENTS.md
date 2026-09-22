@@ -1,9 +1,9 @@
-# Template — Agent Workflow Guide
+# deepFunc — Agent Workflow Guide
 
 ## Task Tracking
 
 Vikunja via skill `vikunja`. Load the skill first.
-Board: project `Template` (five-bucket kanban). Labels are advisory; buckets carry state.
+Board: project `deepFunc` (five-bucket kanban). Labels are advisory; buckets carry state.
 
 ## Every Session
 
@@ -41,15 +41,14 @@ Each script self-locates into the flake devshell, runs from the repo root, and h
 | `bench.sh` | iai-callgrind; `--save-baseline` / `--baseline` pass through |
 | `fuzz.sh` | `cargo fuzz run <package> <target>` — 60s default |
 | `gate.sh` | commit gate: check, clippy, fmt --check, test, test-release, coverage, verify |
-| `init.sh` | one-shot template init (idempotent, handles FHS/Kani) |
 
 Bench and fuzz are not in the gate. Run them on demand per Commit Discipline.
 
 ## Commit Discipline
 
-- One logical change per commit. Message: `template: <what changed>` or `<area>: <what>`.
+- One logical change per commit. Message: `deepfunc: <what changed>` or `<area>: <what>`.
 - `dev-scripts/gate.sh` before every commit. Red gate blocks the commit.
-- Coverage gate is 90% (`coverage.sh --fail-under-lines 90`). It is red on the current scaffold (no tests yet) by design.
+- Coverage gate is 90% lines on `deepfunc-core` (`coverage.sh --fail-under-lines 90` scoped by `gate.sh`; rationale in `DESIGN.md` §6). Binaries carry unit tests for every pure function; IO/LSP paths need live-server integration tests (open item).
 - Conditional, on demand:
   - Hot path: `dev-scripts/bench.sh` vs saved baseline. `Ir` regression blocks the commit.
   - Wire/protocol parser: `dev-scripts/fuzz.sh <package> <target>`.
@@ -81,7 +80,7 @@ Keep the pure core isolated so the IO seam stays small. If a function needs more
 
 ## Performance — callgrind auditing
 
-- iai-callgrind 0.16, `[[bench]] harness = false`, benches in `template-core/benches/`.
+- iai-callgrind 0.16, `[[bench]] harness = false`, benches in `deepfunc-core/benches/`.
 - Baselines under `target/iai/` (`bench.sh --save-baseline=X` / `--baseline=X`). `base_v1` is the placeholder; re-baseline when real hot paths land. Numbers live in `DESIGN.md` §16.
 - Any hot-path change ends with `dev-scripts/bench.sh` compared to the baseline. `Ir` regression blocks the commit.
 

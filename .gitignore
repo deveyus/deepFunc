@@ -1,4 +1,4 @@
 /target
-# runtime state of the keyserv user — never committed (AGENTS.md)
+# runtime state — never committed
 config.db
 audit_log.db

@@ -410,4 +410,137 @@ mod tests {
         assert!(text.contains("E02"));
         assert!(text.contains("help:"));
     }
+
+    #[test]
+    fn every_error_carries_its_code() {
+        let cases = [
+            (
+                super::Error::ServerNotFound {
+                    language: "go".to_owned(),
+                    server: "gopls".to_owned(),
+                    detail: "missing".to_owned(),
+                    install_hint: "install gopls".to_owned(),
+                },
+                "E01",
+            ),
+            (
+                super::Error::BadTarget {
+                    received: "???".to_owned(),
+                },
+                "E03",
+            ),
+            (
+                super::Error::TargetNotFound {
+                    target: "a::b".to_owned(),
+                    workspace: "/w".to_owned(),
+                },
+                "E04",
+            ),
+            (
+                super::Error::RequestFailed {
+                    server: "gopls".to_owned(),
+                    request: "initialize".to_owned(),
+                    timeout_secs: 7,
+                    detail: "boom".to_owned(),
+                },
+                "E06",
+            ),
+            (
+                super::Error::Io {
+                    path: "/p".to_owned(),
+                    message: "gone".to_owned(),
+                },
+                "E07",
+            ),
+            (
+                super::Error::Unsupported {
+                    language: "typescript".to_owned(),
+                    reason: "blocked".to_owned(),
+                },
+                "E08",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code(), code);
+            let text = format!("{error}");
+            assert!(text.contains(code));
+            assert!(text.contains("help:"));
+        }
+    }
+
+    #[test]
+    fn error_help_names_the_fix() {
+        let not_found = super::Error::ServerNotFound {
+            language: "rust".to_owned(),
+            server: "rust-analyzer".to_owned(),
+            detail: "missing".to_owned(),
+            install_hint: "install it".to_owned(),
+        };
+        let text = format!("{not_found}");
+        assert!(text.contains("provision --lang rust"));
+        assert!(text.contains("install it"));
+        let failed = super::Error::RequestFailed {
+            server: "srv".to_owned(),
+            request: "req".to_owned(),
+            timeout_secs: 30,
+            detail: "d".to_owned(),
+        };
+        assert!(format!("{failed}").contains("--timeout"));
+    }
+
+    #[test]
+    fn parse_target_accepts_all_forms() {
+        assert!(parse_target("dial").is_ok());
+        assert!(parse_target("a::b::c").is_ok());
+        assert!(parse_target("a.b.c").is_ok());
+        assert!(parse_target("x.py:1").is_ok());
+        assert!(parse_target("  spaced::fn  ").is_ok());
+        assert!(parse_target("a::b").is_ok());
+    }
+
+    #[test]
+    fn parse_target_rejects_more_garbage() {
+        assert!(parse_target(".leading").is_err());
+        assert!(parse_target("trailing.").is_err());
+        assert!(parse_target("has space::x").is_err());
+        assert!(parse_target("has-dash::x").is_err());
+        assert!(parse_target("file.rs:").is_err());
+        assert!(parse_target("file.rs:12x").is_err());
+        assert!(parse_target(":::").is_err());
+    }
+
+    #[test]
+    fn render_depth2_without_children_notes_it() {
+        let mut report = sample_report();
+        report.depth1[0].called_by.clear();
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("No further callers"));
+    }
+
+    #[test]
+    fn render_body_without_trailing_newline_stays_fenced() {
+        let mut report = sample_report();
+        report.depth1[0].caller.body = "fn x() {}".to_owned();
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("```rust\nfn x() {}\n```"));
+    }
+
+    #[test]
+    fn caller_from_range_clamps_reversed_spans() {
+        let text = "one\ntwo\nthree\n";
+        let caller = caller_from_range(text, "f.rs", "", 2, 0);
+        assert_eq!(caller.line, 1);
+        assert_eq!(caller.end_line, 3);
+        // Empty name falls back to signature parsing, then the file name.
+        assert_eq!(caller.name, "f.rs");
+        let named = caller_from_range(text, "f.rs", "kept", 0, 0);
+        assert_eq!(named.name, "kept");
+        assert_eq!(named.signature, "one");
+    }
+
+    #[test]
+    fn signature_of_empty_body_is_empty() {
+        assert_eq!(super::signature_of(""), "");
+        assert_eq!(super::signature_of("  spaced  \nrest"), "spaced");
+    }
 }

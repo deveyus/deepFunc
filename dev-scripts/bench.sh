@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh" "${BASH_SOURCE[0]}" "$@"
-# keyServ deterministic iai-callgrind instruction-count benchmarks.
+# deepFunc deterministic iai-callgrind instruction-count benchmarks.
 #
 # iai-callgrind measures machine-independent instruction counts (Ir),
 # which gate performance regressions without wall-clock noise. The

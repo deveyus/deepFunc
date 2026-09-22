@@ -4,7 +4,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh" "${BASH_SOURCE[
 # Fuzz one target: dev-scripts/fuzz.sh <package> <target> [max_total_time]
 # Targets live in <package>/fuzz/ (TEST_METHODOLOGY.md). cargo-fuzz
 # operates on the crate in the current directory, so we cd there
-# (keyServ convention: package directory is named after the package).
+# (convention: package directory is named after the package).
 # Default budget: 60 CPU-seconds, per the methodology.
 if [ $# -lt 2 ]; then
   echo "usage: $0 <package> <target> [max_total_time]" >&2

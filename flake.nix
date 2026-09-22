@@ -1,5 +1,5 @@
 {
-  description = "keyServ — secret injection daemon";
+  description = "deepFunc — caller context for LLMs over LSP";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

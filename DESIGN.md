@@ -109,7 +109,7 @@ error[E02]: workspace root not found
 
 Rules:
 
-- Code: stable `E01`–`E07` (see below). Never renumber.
+- Code: stable `E01`–`E08` (see below). Never renumber, only append.
 - `what went wrong`: one line, specific values (paths, names, counts).
 - `note:`: evidence observed (what was checked, what was found).
 - `help:`: corrective action. Use `suspected` language unless the cause is certain. List the most likely fix first, max three steps.
@@ -117,43 +117,47 @@ Rules:
 
 Codes:
 
-- `E01` rust-analyzer binary not found on PATH (`--ra-bin` override, install via rustup component).
-- `E02` workspace root not found (no Cargo.toml walking up from --project).
-- `E03` bad target syntax (want `path::to::fn` or `file.rs:line`; echo what was received).
-- `E04` target definition not found (prepareCallHierarchy empty; suspected: stale check, cfg-gated, trait impl — suggest `cargo check` first).
-- `E05` no callers found (not an error exit by default; emit empty report with note; `--fail-if-empty` flips to error).
-- `E06` rust-analyzer request failed or timed out (include request name, timeout secs; suspected: RA still indexing — suggest retry with --timeout).
-- `E07` file read or output write failed (include path and OS error).
+- `E01` language server not found (per-language install hint, or `deepfunc provision --lang`).
+- `E02` workspace root not found (no language marker walking up from --project).
+- `E03` bad target or flag syntax (echo what was received).
+- `E04` target definition not found after the readiness wait.
+- `E05` reserved: no callers found is NOT an error exit (empty report with note); `--fail-if-empty` flips it to E04.
+- `E06` server request failed or timed out (server name, request, timeout-epilogue with the server's message).
+- `E07` filesystem failure with path context.
+- `E08` language wired but known-broken (typescript: server never answers post-load requests).
 
-## 6. Open items (updated: cold-index race solved)
+## 6. Open items and solved record
 
 Solved, with evidence:
 
 - `serverStatus/quiescent` never arrives on a bare stdio client (verified:
-  60s probe shows only `workspace/diagnostic/refresh`). It is tracked when
-  present but NOTHING gates on it.
-- Gate is index stability: `workspace/symbol` polls until the answer is
-  non-empty AND unchanged across two polls, or 45s budget. A stable index
-  means empty hierarchy answers are genuine, not races.
-- RA answers `null` (not `[]`) while indexing and for unresolvable
-  positions. All three decoders (`workspace/symbol`, `prepare`, incoming)
-  treat null as empty.
-- RA `prepareCallHierarchy` resolves identifier positions but returns []
-  for mid-body positions (verified raw). `file:line` targets therefore map
-  to a name locally (`fn_name_near`: same line, else below for docs/attrs,
-  else above for bodies) and reuse the symbol path filtered to the file.
+  60s probe shows only `workspace/diagnostic/refresh`). Tracked when
+  present; nothing gates on it.
+- Readiness/liveness split: `ensure_index_ready` gates on canary `"a"`
+  (non-empty + stable count across polls, 30s budget, errors count as
+  loading). Target lookups then trust empty after short retries. Unknown
+  names fail in load-time + ~3s.
+- Servers answer `null` (not `[]`) while indexing and for unresolvable
+  positions. All decoders treat null as empty.
+- `prepareCallHierarchy` resolves identifier positions but returns []
+  for mid-body positions (verified raw). `file:line` targets therefore
+  resolve via `documentSymbol` innermost-callable lookup — no text
+  parsing, works in every language.
 - Workspace root is lexically normalized (trailing `/.` poisoned
   hand-built `file://` URIs).
-- Per-query retry backstops remain: 20s on empty `prepare`/incoming while
-  not quiescent.
+- Module-scope callers (pyright) report the call-site line as their
+  signature (a module has none).
+- Seed `didOpen`: some servers only build a project model once a file is
+  open; one seed file opens before querying.
 
 Remaining:
 
-- Per-invocation RA spawn pays full workspace load each run (~30s here).
+- Per-invocation server spawn pays full workspace load each run (~30s).
   No daemon per operator decision.
-- Readiness/liveness split: `ensure_index_ready` gates on canary `"a"`
-  (non-empty + stable count, 30s budget); target lookups then trust empty
-  after one 3s retry. Unknown names fail in load-time + ~3s. Hierarchy
-  empties carry a 5s backstop only. A workspace with no `a`-matching
-  function names would burn the canary budget and proceed unguarded
-  (accepted: vanishingly rare, still correct, just slower).
+- Coverage gate (90% lines) applies to `deepfunc-core` only. Binaries are
+  IO/LSP/network-bound: unit tests cover every pure function (arg
+  parsing, path math, symbol-tree walk, archive roundtrips, error
+  rendering), but hierarchy walks, downloads, and spawns need live
+  servers. Integration tests against fixture workspaces are the tracked
+  follow-up; the full-workspace coverage report still prints for
+  visibility on every gate run.

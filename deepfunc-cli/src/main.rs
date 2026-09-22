@@ -770,3 +770,188 @@ fn run_provision(argv: &[String]) -> Result<Vec<provision::ProvisionReport>, Err
     }
     Ok(reports)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        display_path, find_workspace_root, language, parse_file_line, parse_u64, target_ident,
+    };
+    use std::path::Path;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("deepfunc".to_owned())
+            .chain(parts.iter().map(|part| part.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_args_happy_path() {
+        let parsed = super::parse_args(&argv(&[
+            "--project",
+            ".",
+            "--target",
+            "a::b",
+            "--lang",
+            "go",
+            "--timeout",
+            "42",
+            "--fail-if-empty",
+        ]));
+        assert!(parsed.is_ok());
+        if let Ok(args) = parsed {
+            assert_eq!(args.lang, "go");
+            assert_eq!(args.timeout_secs, 42);
+            assert!(args.fail_if_empty);
+            assert!(args.server_bin.is_none());
+        }
+    }
+
+    #[test]
+    fn parse_args_rejects_problems() {
+        assert!(super::parse_args(&argv(&[])).is_err());
+        assert!(super::parse_args(&argv(&["--project", "."])).is_err());
+        assert!(super::parse_args(&argv(&["--target", "x"])).is_err());
+        assert!(super::parse_args(&argv(&["--project"])).is_err());
+        assert!(super::parse_args(&argv(&["--target"])).is_err());
+        assert!(super::parse_args(&argv(&["--out"])).is_err());
+        assert!(super::parse_args(&argv(&["--lang"])).is_err());
+        assert!(super::parse_args(&argv(&["--server-bin"])).is_err());
+        assert!(super::parse_args(&argv(&["--timeout"])).is_err());
+        assert!(super::parse_args(&argv(&["--nope"])).is_err());
+        assert!(super::parse_args(&argv(&[
+            "--project",
+            ".",
+            "--target",
+            "x",
+            "--timeout",
+            "nan"
+        ]))
+        .is_err());
+        assert!(super::parse_args(&argv(&["--help"])).is_err());
+        let with_bin = super::parse_args(&argv(&[
+            "--project",
+            ".",
+            "--target",
+            "x",
+            "--server-bin",
+            "/bin/srv",
+            "--out",
+            "o.md",
+        ]));
+        assert!(with_bin.is_ok());
+        if let Ok(with_bin) = with_bin {
+            assert_eq!(with_bin.server_bin, Some("/bin/srv".to_owned()));
+            assert_eq!(with_bin.out, Some(Path::new("o.md").to_path_buf()));
+        }
+    }
+
+    #[test]
+    fn parse_u64_accepts_digits() {
+        assert_eq!(parse_u64("30", "--timeout").unwrap_or_default(), 30);
+        assert!(parse_u64("x", "--timeout").is_err());
+        assert!(parse_u64("", "--timeout").is_err());
+    }
+
+    #[test]
+    fn language_table_resolves_all() {
+        for id in ["rust", "python", "typescript", "go"] {
+            let resolved = language(id);
+            assert!(resolved.is_ok());
+            if let Ok(lang) = resolved {
+                assert_eq!(lang.id, id);
+                assert!(!lang.server_cmd.is_empty());
+                assert!(!lang.markers.is_empty());
+                assert!(!lang.install_hint.is_empty());
+            }
+        }
+        assert!(language("cobol").is_err());
+        assert!(language("").is_err());
+        // Only typescript carries the loud broken flag.
+        assert!(matches!(language("typescript"), Ok(lang) if lang.broken.is_some()));
+        assert!(matches!(language("rust"), Ok(lang) if lang.broken.is_none()));
+    }
+
+    #[test]
+    fn workspace_root_walks_up_and_cleans() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            let nested = dir.path().join("a/b");
+            assert!(std::fs::create_dir_all(&nested).is_ok());
+            assert!(std::fs::write(dir.path().join("Cargo.toml"), "[package]").is_ok());
+            let root = find_workspace_root(&nested, &["Cargo.toml"]);
+            assert!(root.is_ok());
+            if let Ok(root) = root {
+                assert_eq!(root, dir.path());
+                assert!(!root.display().to_string().ends_with('.'));
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_root_reports_markers() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            let error = find_workspace_root(dir.path(), &["Cargo.toml"]);
+            assert!(error.is_err());
+            if let Err(error) = error {
+                let text = format!("{error}");
+                assert!(text.contains("E02"));
+                assert!(text.contains("Cargo.toml"));
+            }
+            let missing = find_workspace_root(&dir.path().join("nope"), &["go.mod"]);
+            assert!(missing.is_err());
+            if let Err(error) = missing {
+                assert!(format!("{error}").contains("go.mod"));
+            }
+        }
+    }
+
+    #[test]
+    fn target_ident_takes_last_segment() {
+        assert_eq!(target_ident("a::b::func"), "func");
+        assert_eq!(target_ident("os.path.join"), "join");
+        assert_eq!(target_ident("solo"), "solo");
+    }
+
+    #[test]
+    fn parse_file_line_accepts_any_extension() {
+        let root = Path::new("/w");
+        let parsed = parse_file_line(root, "src/a.go:12");
+        assert!(parsed.is_some());
+        if let Some((path, line)) = parsed {
+            assert_eq!(line, 11);
+            assert!(path.ends_with("src/a.go"));
+        }
+        assert!(parse_file_line(root, "crate::m::f").is_none());
+        assert!(parse_file_line(root, "a.rs:0").is_none());
+        assert!(parse_file_line(root, "a.rs:").is_none());
+        assert!(parse_file_line(root, "a.rs:1x").is_none());
+        assert!(parse_file_line(root, "nodot:12").is_none());
+    }
+
+    #[test]
+    fn display_path_relativizes() {
+        let root = Path::new("/w");
+        assert_eq!(display_path(root, Path::new("/w/a.rs")), "a.rs");
+        assert_eq!(display_path(root, Path::new("/other/a.rs")), "/other/a.rs");
+    }
+
+    #[test]
+    fn seed_file_finds_sources_and_skips_build_dirs() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            assert!(std::fs::create_dir_all(dir.path().join("target")).is_ok());
+            assert!(std::fs::write(dir.path().join("target/skip.rs"), "fn skip() {}").is_ok());
+            assert!(std::fs::write(dir.path().join("main.rs"), "fn main() {}").is_ok());
+            let found = super::seed_file(dir.path(), &["rs"]);
+            assert!(found.is_some());
+            if let Some(found) = found {
+                assert!(found.ends_with("main.rs"));
+            }
+            assert!(super::seed_file(dir.path(), &["go"]).is_none());
+        }
+    }
+}

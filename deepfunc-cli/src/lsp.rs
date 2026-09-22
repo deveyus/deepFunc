@@ -706,3 +706,152 @@ fn hex_value(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{innermost_callable, is_callable, uri_to_path, DocumentSymbol, Position, Range};
+
+    fn span(start: u32, end: u32) -> Range {
+        Range {
+            start: Position {
+                line: start,
+                character: 0,
+            },
+            end: Position {
+                line: end,
+                character: 1,
+            },
+        }
+    }
+
+    fn symbol(kind: u32, start: u32, end: u32, children: Vec<DocumentSymbol>) -> DocumentSymbol {
+        DocumentSymbol {
+            kind,
+            range: span(start, end),
+            selection_range: span(start, end),
+            children,
+        }
+    }
+
+    #[test]
+    fn callable_kinds_cover_methods_constructors_functions() {
+        assert!(is_callable(6));
+        assert!(is_callable(9));
+        assert!(is_callable(12));
+        assert!(!is_callable(2));
+        assert!(!is_callable(5));
+        assert!(!is_callable(0));
+        assert!(!is_callable(255));
+    }
+
+    #[test]
+    fn innermost_callable_descends_and_skips_modules() {
+        let tree = vec![
+            symbol(
+                2,
+                0,
+                30,
+                vec![
+                    symbol(12, 5, 20, vec![symbol(6, 10, 15, vec![])]),
+                    symbol(5, 22, 25, vec![]),
+                ],
+            ),
+            symbol(12, 40, 45, vec![]),
+        ];
+        let found = innermost_callable(&tree, 12);
+        assert!(found.is_some());
+        if let Some(found) = found {
+            assert_eq!(found.sel_pos0(), (10, 0));
+        }
+        // Inside outer but outside inner: outer wins.
+        let found = innermost_callable(&tree, 7);
+        assert!(found.is_some());
+        if let Some(found) = found {
+            assert_eq!(found.range.start.line, 5);
+            assert_eq!(found.range.end.line, 20);
+        }
+        // Inside a non-callable (field): skipped.
+        assert!(innermost_callable(&tree, 23).is_none());
+        // Inside the module but outside any callable: skipped.
+        assert!(innermost_callable(&tree, 2).is_none());
+        // Outside everything: None.
+        assert!(innermost_callable(&tree, 99).is_none());
+        assert!(innermost_callable(&[], 0).is_none());
+    }
+
+    #[test]
+    fn uri_to_path_decodes_files() {
+        assert_eq!(
+            uri_to_path("file:///home/u/proj/main.rs"),
+            Some("/home/u/proj/main.rs".to_owned())
+        );
+        assert_eq!(
+            uri_to_path("file:///home/my%20dir/a.rs"),
+            Some("/home/my dir/a.rs".to_owned())
+        );
+        assert_eq!(uri_to_path("file:///a%2Fb.rs"), Some("/a/b.rs".to_owned()));
+        assert!(uri_to_path("https://example.com/a.rs").is_none());
+        assert!(uri_to_path("not-a-uri").is_none());
+        assert!(uri_to_path("file://").is_some());
+    }
+
+    #[test]
+    fn hierarchy_accessors_report_positions() {
+        let item = super::HierarchyItem {
+            name: "dial".to_owned(),
+            kind: 12,
+            uri: "file:///w/a.rs".to_owned(),
+            range: span(10, 20),
+            selection_range: span(10, 10),
+        };
+        assert_eq!(item.name(), "dial");
+        assert_eq!(item.kind(), 12);
+        assert_eq!(item.uri(), "file:///w/a.rs");
+        assert_eq!(item.def_span0(), (10, 20));
+        assert_eq!(item.sel_pos0(), (10, 0));
+        let call = super::IncomingCall {
+            from: item,
+            from_ranges: vec![span(30, 30)],
+        };
+        assert_eq!(call.from().name(), "dial");
+        assert_eq!(call.call_line1(), 31);
+        let no_ranges = super::IncomingCall {
+            from: super::HierarchyItem {
+                name: "x".to_owned(),
+                kind: 6,
+                uri: "u".to_owned(),
+                range: span(0, 0),
+                selection_range: span(0, 0),
+            },
+            from_ranges: Vec::new(),
+        };
+        assert_eq!(no_ranges.call_line1(), 1);
+    }
+
+    #[test]
+    fn symbol_info_accessors() {
+        let info = super::SymbolInfo {
+            name: "f".to_owned(),
+            kind: 12,
+            location: super::Location {
+                uri: "file:///w/b.py".to_owned(),
+                range: span(3, 9),
+            },
+            container_name: Some("mod".to_owned()),
+        };
+        assert_eq!(info.name(), "f");
+        assert_eq!(info.container(), Some("mod"));
+        assert_eq!(info.uri(), "file:///w/b.py");
+        assert_eq!((info.line0(), info.char0()), (3, 0));
+        let bare = super::SymbolInfo {
+            name: "g".to_owned(),
+            kind: 6,
+            location: super::Location {
+                uri: "u".to_owned(),
+                range: span(0, 0),
+            },
+            container_name: None,
+        };
+        assert!(bare.container().is_none());
+    }
+}

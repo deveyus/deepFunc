@@ -811,3 +811,185 @@ pub fn provision(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{manifest_server, npm_bin_entry, verify_sha1, verify_sha256};
+
+    #[test]
+    fn sha_helpers_match_known_vectors() {
+        assert_eq!(
+            super::sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            super::sha1_hex(b""),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert!(verify_sha256(
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "t"
+        )
+        .is_ok());
+        assert!(verify_sha256(b"abc", "dead", "t").is_err());
+        assert!(verify_sha1(b"abc", "a9993e364706816aba3e25717850c26c9cd0d89d", "t").is_ok());
+        assert!(verify_sha1(b"abc", "dead", "t").is_err());
+        // Case-insensitive expected digests.
+        assert!(verify_sha256(
+            b"abc",
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
+            "t"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn manifest_server_reads_provisioned_copies() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            let lang_dir = dir.path().join("go");
+            assert!(std::fs::create_dir_all(&lang_dir).is_ok());
+            let bin = lang_dir.join("server");
+            assert!(std::fs::write(&bin, "#!/bin/sh\n").is_ok());
+            let manifest = serde_json::json!({
+                "language": "go",
+                "version": "v0.23.0",
+                "program": bin.to_str().unwrap_or(""),
+            });
+            assert!(std::fs::write(
+                lang_dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap_or_default()
+            )
+            .is_ok());
+            let found = manifest_server(dir.path(), "go");
+            assert!(found.is_some());
+            if let Some((program, args)) = found {
+                assert_eq!(program, bin.display().to_string());
+                assert!(args.is_empty());
+            }
+            // Missing manifest, corrupt manifest, and dangling program all miss.
+            assert!(manifest_server(dir.path(), "rust").is_none());
+            assert!(std::fs::write(lang_dir.join("manifest.json"), "{oops").is_ok());
+            assert!(manifest_server(dir.path(), "go").is_none());
+        }
+    }
+
+    #[test]
+    fn npm_bin_entry_resolves_package_layout() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            let package = dir.path().join("package");
+            assert!(std::fs::create_dir_all(package.join("lib")).is_ok());
+            assert!(std::fs::write(
+                package.join("package.json"),
+                r#"{"bin": {"my-server": "lib/cli.mjs"}}"#
+            )
+            .is_ok());
+            assert!(std::fs::write(package.join("lib/cli.mjs"), "js").is_ok());
+            let entry = npm_bin_entry(&package, "my-server");
+            assert!(entry.is_ok());
+            if let Ok(entry) = entry {
+                assert!(entry.ends_with("lib/cli.mjs"));
+            }
+            assert!(npm_bin_entry(&package, "missing").is_err());
+            assert!(npm_bin_entry(dir.path(), "my-server").is_err());
+        }
+    }
+
+    fn make_tar_bytes() -> Option<Vec<u8>> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_bytes);
+            let content = b"hello";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "pkg/a.txt", &content[..])
+                .ok()?;
+            archive.into_inner().ok()?;
+        }
+        Some(tar_bytes)
+    }
+
+    fn make_payload_tar_bytes() -> Option<Vec<u8>> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_bytes);
+            let content = b"payload";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "p/b.txt", &content[..])
+                .ok()?;
+            archive.into_inner().ok()?;
+        }
+        Some(tar_bytes)
+    }
+
+    #[test]
+    fn tgz_roundtrip_preserves_files() {
+        let dir = tempfile::tempdir().ok();
+        assert!(dir.is_some());
+        if let Some(dir) = dir {
+            // gzip the tar bytes with the same crates provision uses.
+            let tar_bytes = make_tar_bytes();
+            assert!(tar_bytes.is_some());
+            if let Some(tar_bytes) = tar_bytes {
+                let mut gzipped = Vec::new();
+                {
+                    use std::io::Write;
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(&mut gzipped, flate2::Compression::fast());
+                    assert!(encoder.write_all(&tar_bytes).is_ok());
+                    assert!(encoder.finish().is_ok());
+                }
+                let dest = dir.path().join("out");
+                assert!(std::fs::create_dir_all(&dest).is_ok());
+                assert!(super::unpack_tgz(&gzipped, &dest, "test").is_ok());
+                let back = std::fs::read(dest.join("pkg/a.txt")).ok();
+                assert!(back.is_some());
+                if let Some(back) = back {
+                    assert_eq!(back, b"hello");
+                }
+                assert!(super::unpack_tgz(b"garbage", &dest, "test").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn xz_roundtrip_preserves_tar() {
+        // Build a raw tar, xz-compress it, unpack via provision's path.
+        let tar_bytes = make_payload_tar_bytes();
+        assert!(tar_bytes.is_some());
+        if let Some(tar_bytes) = tar_bytes {
+            let mut packed = Vec::new();
+            assert!(lzma_rs::xz_compress(&mut &tar_bytes[..], &mut packed).is_ok());
+            let dir = tempfile::tempdir().ok();
+            assert!(dir.is_some());
+            if let Some(dir) = dir {
+                let dest = dir.path().join("out");
+                assert!(std::fs::create_dir_all(&dest).is_ok());
+                assert!(super::unpack_txz(&packed, &dest, "test").is_ok());
+                let back = std::fs::read(dest.join("p/b.txt")).ok();
+                assert!(back.is_some());
+                if let Some(back) = back {
+                    assert_eq!(back, b"payload");
+                }
+                assert!(super::unpack_txz(b"garbage", &dest, "test").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn host_detection_runs() {
+        // Host-dependent by nature; execution coverage only.
+        let _ = super::host_is_nixos();
+    }
+}
