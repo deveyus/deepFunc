@@ -31,6 +31,30 @@ const PYRIGHT_VERSION: &str = "1.1.414";
 const TS_VERSION: &str = "6.0.0";
 const NODE_VERSION: &str = "v24.11.1";
 
+/// Per-OS distribution selectors. macOS has no entries: provision
+/// refuses it outright (see `provision`).
+#[cfg(windows)]
+const RA_ASSET: &str = "rust-analyzer-x86_64-pc-windows-msvc.zip";
+#[cfg(not(windows))]
+const RA_ASSET: &str = "rust-analyzer-x86_64-unknown-linux-gnu.gz";
+#[cfg(windows)]
+const NODE_OS: &str = "win-x64";
+#[cfg(not(windows))]
+const NODE_OS: &str = "linux-x64";
+#[cfg(windows)]
+const NODE_EXT: &str = "zip";
+#[cfg(not(windows))]
+const NODE_EXT: &str = "tar.xz";
+#[cfg(windows)]
+const GO_DIST_SUFFIX: &str = ".windows-amd64.zip";
+#[cfg(not(windows))]
+const GO_DIST_SUFFIX: &str = ".linux-amd64.tar.gz";
+/// Executable suffix for installed binaries and wrappers.
+#[cfg(windows)]
+const EXE: &str = ".exe";
+#[cfg(not(windows))]
+const EXE: &str = "";
+
 /// Where a provisioned server lives and how to run it.
 pub struct ProvisionReport {
     pub language: String,
@@ -38,25 +62,30 @@ pub struct ProvisionReport {
     /// Runnable path for `--server-bin`: a binary or a wrapper script.
     pub program: String,
 }
-
 /// Default servers root: `$XDG_DATA_HOME/deepfunc/servers`, falling back
-/// to `~/.local/share/deepfunc/servers`.
+/// to `~/.local/share/deepfunc/servers`, and on Windows to
+/// `%LOCALAPPDATA%/deepfunc/servers`.
 pub fn default_servers_dir() -> Result<PathBuf, Error> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("deepfunc/servers"));
         }
     }
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => {
-            Ok(PathBuf::from(home).join(".local/share/deepfunc/servers"))
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home).join(".local/share/deepfunc/servers"));
         }
-        _ => Err(Error::Io {
-            path: "$HOME".to_owned(),
-            message: "cannot determine servers dir: set $HOME or $XDG_DATA_HOME, or pass --dir"
-                .to_owned(),
-        }),
     }
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return Ok(PathBuf::from(local).join("deepfunc/servers"));
+        }
+    }
+    Err(Error::Io {
+        path: "servers dir".to_owned(),
+        message: "cannot determine servers dir: set $XDG_DATA_HOME, $HOME (or %LOCALAPPDATA% on Windows), or pass --dir".to_owned(),
+    })
 }
 
 fn ensure_dir(path: &Path) -> Result<(), Error> {
@@ -147,7 +176,10 @@ fn download(url: &str) -> Result<Vec<u8>, Error> {
     };
     let mut bytes = Vec::new();
     match response.into_reader().read_to_end(&mut bytes) {
-        Ok(_) => Ok(bytes),
+        Ok(_) => {
+            tracing::debug!(bytes = bytes.len(), url, "downloaded");
+            Ok(bytes)
+        }
         Err(error) => Err(Error::Io {
             path: url.to_owned(),
             message: "failed reading download body: ".to_owned() + &error.to_string(),
@@ -222,6 +254,27 @@ fn unpack_tgz(bytes: &[u8], dest: &Path, what: &str) -> Result<(), Error> {
     }
 }
 
+/// Unpack a .zip archive into `dest`.
+fn unpack_zip(bytes: &[u8], dest: &Path, what: &str) -> Result<(), Error> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = match zip::ZipArchive::new(cursor) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return Err(Error::Io {
+                path: what.to_owned(),
+                message: "zip open failed (truncated download?): ".to_owned() + &error.to_string(),
+            })
+        }
+    };
+    match archive.extract(dest) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Error::Io {
+            path: what.to_owned(),
+            message: "zip unpack failed: ".to_owned() + &error.to_string(),
+        }),
+    }
+}
+
 /// Unpack a .tar.xz archive into `dest`.
 fn unpack_txz(bytes: &[u8], dest: &Path, what: &str) -> Result<(), Error> {
     let mut tar_bytes = Vec::new();
@@ -289,6 +342,34 @@ fn system_node(dir: &Path, version: &str) -> Result<PathBuf, Error> {
         }),
     }
 }
+/// Existence + executable-bit check for installer-built binaries
+/// (`go install` verifies module hashes itself; the bit is the remaining
+/// check). No version-flag smoke: servers serve on stdio instead.
+fn assert_executable(path: &Path, what: &str) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0 => Ok(()),
+            _ => Err(Error::Io {
+                path: path.display().to_string(),
+                message: what.to_owned(),
+            }),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if path.is_file() {
+            Ok(())
+        } else {
+            Err(Error::Io {
+                path: path.display().to_string(),
+                message: what.to_owned(),
+            })
+        }
+    }
+}
+
 /// True when /etc/os-release identifies NixOS. Best-effort: unreadable
 /// means "not NixOS" (provision proceeds; smoke test catches the rest).
 fn host_is_nixos() -> bool {
@@ -298,18 +379,38 @@ fn host_is_nixos() -> bool {
     }
 }
 
-/// Write an executable wrapper: `exec "<program>" <args...> "$@"`.
+/// Write an executable wrapper running `program` with fixed args plus
+/// caller args. Shell script on unix, batch file on Windows (untested
+/// there so far: plain `cmd.exe` quoting, no PowerShell dependency).
 fn write_wrapper(path: &Path, program: &str, args: &[&str]) -> Result<(), Error> {
-    let mut text =
-        "#!/bin/sh\n# generated by `deepfunc provision`; do not edit.\nexec \"".to_owned();
-    text.push_str(program);
-    text.push('"');
-    for arg in args {
-        text.push_str(" \"");
-        text.push_str(arg);
+    #[cfg(windows)]
+    let text = {
+        let mut text =
+            "@echo off\r\nREM generated by `deepfunc provision`; do not edit.\r\n\"".to_owned();
+        text.push_str(&program.replace('/', "\\"));
         text.push('"');
-    }
-    text.push_str(" \"$@\"\n");
+        for arg in args {
+            text.push_str(" \"");
+            text.push_str(&arg.replace('/', "\\"));
+            text.push('"');
+        }
+        text.push_str(" %*\r\n");
+        text
+    };
+    #[cfg(not(windows))]
+    let text = {
+        let mut text =
+            "#!/bin/sh\n# generated by `deepfunc provision`; do not edit.\nexec \"".to_owned();
+        text.push_str(program);
+        text.push('"');
+        for arg in args {
+            text.push_str(" \"");
+            text.push_str(arg);
+            text.push('"');
+        }
+        text.push_str(" \"$@\"\n");
+        text
+    };
     if let Err(error) = std::fs::write(path, text) {
         return Err(Error::Io {
             path: path.display().to_string(),
@@ -317,6 +418,23 @@ fn write_wrapper(path: &Path, program: &str, args: &[&str]) -> Result<(), Error>
         });
     }
     chmod_exec(path)
+}
+
+/// Wrapper file name for a language server (`server` / `server.bat`).
+fn wrapper_path(dir: &Path) -> PathBuf {
+    dir.join("bin").join("server".to_owned() + wrapper_ext())
+}
+
+/// Wrapper file extension, empty on unix.
+#[cfg(windows)]
+fn wrapper_ext() -> &'static str {
+    ".bat"
+}
+
+/// Wrapper file extension, empty on unix.
+#[cfg(not(windows))]
+fn wrapper_ext() -> &'static str {
+    ""
 }
 
 /// Smoke test: the binary must answer a version flag. Used only where no
@@ -352,18 +470,24 @@ fn smoke_version(program: &str) -> Result<(), Error> {
     })
 }
 
+/// Canonical node binary location: `_node/bin/node` (+`.exe` on Windows).
+fn node_binary_path(root: &Path) -> PathBuf {
+    root.join("_node/bin").join("node".to_owned() + EXE)
+}
+
 /// Shared node runtime for the JS servers. Returns its binary path.
 /// On NixOS the nodejs.org binary cannot execute (stub-ld), so the
 /// system node is used when present; elsewhere it is downloaded.
 fn provision_node(root: &Path, version: &str) -> Result<PathBuf, Error> {
-    let dir = root.join("_node");
-    let binary = dir.join("bin/node");
+    let binary = node_binary_path(root);
     if binary.is_file() {
         return Ok(binary);
     }
     if host_is_nixos() {
+        let dir = root.join("_node");
         return system_node(&dir, version);
     }
+    let dir = root.join("_node");
     ensure_dir(&dir)?;
     // Pinned SHASUMS entry, fetched live so tampering with the list itself
     // fails closed against the pin below only by version string.
@@ -379,7 +503,7 @@ fn provision_node(root: &Path, version: &str) -> Result<PathBuf, Error> {
             })
         }
     };
-    let want = "node-".to_owned() + version + "-linux-x64.tar.xz";
+    let want = "node-".to_owned() + version + "-" + NODE_OS + "." + NODE_EXT;
     let mut expected: Option<String> = None;
     for line in sums_text.lines() {
         let mut parts = line.split_whitespace();
@@ -400,17 +524,29 @@ fn provision_node(root: &Path, version: &str) -> Result<PathBuf, Error> {
     };
     let bytes = download(&(base + &want))?;
     verify_sha256(&bytes, &expected, &want)?;
-    unpack_txz(&bytes, &dir, &want)?;
-    // Tarball root is node-<version>-linux-x64/; hoist bin/ up.
-    let nested_dir = dir.join("node-".to_owned() + version + "-linux-x64");
-    let nested = nested_dir.join("bin/node");
+    tracing::info!(version, "node checksum verified");
+    if NODE_EXT == "zip" {
+        unpack_zip(&bytes, &dir, &want)?;
+    } else {
+        unpack_txz(&bytes, &dir, &want)?;
+    }
+    // Tarball root is node-<version>-<os>/; hoist the node binary up.
+    // Layout differs per OS (bin/node vs root node.exe): first hit wins.
+    let nested_dir = dir.join("node-".to_owned() + version + "-" + NODE_OS);
+    let candidates = [
+        nested_dir.join("bin").join("node".to_owned() + EXE),
+        nested_dir.join("node".to_owned() + EXE),
+    ];
     ensure_dir(&dir.join("bin"))?;
-    if nested.is_file() && !binary.is_file() {
-        if let Err(error) = std::fs::rename(&nested, &binary) {
-            return Err(Error::Io {
-                path: binary.display().to_string(),
-                message: "cannot place node binary: ".to_owned() + &error.to_string(),
-            });
+    for nested in &candidates {
+        if nested.is_file() && !binary.is_file() {
+            if let Err(error) = std::fs::rename(nested, &binary) {
+                return Err(Error::Io {
+                    path: binary.display().to_string(),
+                    message: "cannot place node binary: ".to_owned() + &error.to_string(),
+                });
+            }
+            break;
         }
     }
     // Prune the rest (headers, npm, docs): only bin/node ships.
@@ -425,7 +561,8 @@ fn provision_node(root: &Path, version: &str) -> Result<PathBuf, Error> {
     if !binary.is_file() {
         return Err(Error::Io {
             path: dir.display().to_string(),
-            message: "node tarball unpacked without bin/node at the expected layout".to_owned(),
+            message: "node archive unpacked without a node binary at the expected layout"
+                .to_owned(),
         });
     }
     smoke_version(binary.to_str().unwrap_or("node"))?;
@@ -509,6 +646,7 @@ fn provision_npm(
     let (tarball_url, shasum) = npm_dist(package, version)?;
     let bytes = download(&tarball_url)?;
     verify_sha1(&bytes, &shasum, &tarball_url)?;
+    tracing::info!(package, version, "npm tarball checksum verified");
     let package_dir = dir.join("package");
     if package_dir.is_dir() {
         if let Err(error) = std::fs::remove_dir_all(&package_dir) {
@@ -528,7 +666,7 @@ fn provision_npm(
     }
     let bindir = dir.join("bin");
     ensure_dir(&bindir)?;
-    let wrapper = bindir.join("server");
+    let wrapper = wrapper_path(&dir);
     let node_str = node.to_str().unwrap_or("node");
     let entry_str = entry.to_str().unwrap_or("");
     write_wrapper(&wrapper, node_str, &[entry_str, server_args[0]])?;
@@ -550,10 +688,12 @@ fn provision_npm(
 }
 
 fn provision_rust(root: &Path, version: &str) -> Result<ProvisionReport, Error> {
-    if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
+    if std::env::consts::ARCH != "x86_64"
+        || (std::env::consts::OS != "linux" && std::env::consts::OS != "windows")
+    {
         return Err(Error::Io {
             path: "rust-analyzer".to_owned(),
-            message: "prebuilt binary only ships for x86_64 linux (this host: ".to_owned()
+            message: "prebuilt binary only ships for x86_64 linux/windows (this host: ".to_owned()
                 + std::env::consts::OS
                 + "/"
                 + std::env::consts::ARCH
@@ -572,34 +712,46 @@ fn provision_rust(root: &Path, version: &str) -> Result<ProvisionReport, Error> 
     // documented here rather than pretended otherwise.
     let url = "https://github.com/rust-lang/rust-analyzer/releases/download/".to_owned()
         + version
-        + "/rust-analyzer-x86_64-unknown-linux-gnu.gz";
+        + "/"
+        + RA_ASSET;
     let bytes = download(&url)?;
-    let target = dir.join("rust-analyzer");
-    // Scope the writer: the fd must close before the smoke test execs
-    // the binary, or exec fails with ETXTBSY (Text file busy).
-    {
-        let file = match std::fs::File::create(&target) {
-            Ok(file) => file,
-            Err(error) => {
-                return Err(Error::Io {
-                    path: target.display().to_string(),
-                    message: "cannot write binary: ".to_owned() + &error.to_string(),
-                })
-            }
-        };
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut writer = std::io::BufWriter::new(file);
-        if let Err(error) = std::io::copy(&mut decoder, &mut writer) {
+    let target = dir.join("rust-analyzer".to_owned() + EXE);
+    if RA_ASSET.ends_with(".zip") {
+        unpack_zip(&bytes, &dir, &url)?;
+        if !target.is_file() {
             return Err(Error::Io {
                 path: target.display().to_string(),
-                message: "gunzip failed (truncated download?): ".to_owned() + &error.to_string(),
+                message: "asset unpacked without the binary at the expected layout".to_owned(),
             });
         }
-        if let Err(error) = writer.flush() {
-            return Err(Error::Io {
-                path: target.display().to_string(),
-                message: "failed flushing binary: ".to_owned() + &error.to_string(),
-            });
+    } else {
+        // Scope the writer: the fd must close before the smoke test execs
+        // the binary, or exec fails with ETXTBSY (Text file busy).
+        {
+            let file = match std::fs::File::create(&target) {
+                Ok(file) => file,
+                Err(error) => {
+                    return Err(Error::Io {
+                        path: target.display().to_string(),
+                        message: "cannot write binary: ".to_owned() + &error.to_string(),
+                    })
+                }
+            };
+            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+            let mut writer = std::io::BufWriter::new(file);
+            if let Err(error) = std::io::copy(&mut decoder, &mut writer) {
+                return Err(Error::Io {
+                    path: target.display().to_string(),
+                    message: "gunzip failed (truncated download?): ".to_owned()
+                        + &error.to_string(),
+                });
+            }
+            if let Err(error) = writer.flush() {
+                return Err(Error::Io {
+                    path: target.display().to_string(),
+                    message: "failed flushing binary: ".to_owned() + &error.to_string(),
+                });
+            }
         }
     }
     chmod_exec(&target)?;
@@ -637,7 +789,7 @@ fn go_toolchain_file(version: &str) -> Result<(String, String), Error> {
                 .get("filename")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            if name == version.to_owned() + ".linux-amd64.tar.gz" {
+            if name == version.to_owned() + GO_DIST_SUFFIX {
                 let archive = file
                     .get("filename")
                     .and_then(|value| value.as_str())
@@ -661,22 +813,28 @@ fn go_toolchain_file(version: &str) -> Result<(String, String), Error> {
     }
     Err(Error::Io {
         path: url.to_owned(),
-        message: "go.dev has no linux-amd64 toolchain for ".to_owned() + version,
+        message: "go.dev has no ".to_owned() + GO_DIST_SUFFIX + " toolchain for " + version,
     })
 }
 
 fn provision_go(root: &Path, version: &str, gopls_version: &str) -> Result<ProvisionReport, Error> {
     let dir = root.join("go");
     ensure_dir(&dir)?;
-    // Stage 1: toolchain tarball (self-contained; needs no system go).
+    // Stage 1: toolchain archive (self-contained; needs no system go).
+    // Layout is `go/` on both tgz and zip distributions.
     let toolchain_dir = dir.join("toolchain");
-    let go_binary = toolchain_dir.join("go/bin/go");
+    let go_binary = toolchain_dir.join("go/bin").join("go".to_owned() + EXE);
     if !go_binary.is_file() {
         ensure_dir(&toolchain_dir)?;
         let (dl, sha) = go_toolchain_file(version)?;
         let bytes = download(&dl)?;
         verify_sha256(&bytes, &sha, &dl)?;
-        unpack_tgz(&bytes, &toolchain_dir, &dl)?;
+        tracing::info!(version, "go toolchain checksum verified");
+        if dl.ends_with(".zip") {
+            unpack_zip(&bytes, &toolchain_dir, &dl)?;
+        } else {
+            unpack_tgz(&bytes, &toolchain_dir, &dl)?;
+        }
     }
     if !go_binary.is_file() {
         return Err(Error::Io {
@@ -720,18 +878,31 @@ fn provision_go(root: &Path, version: &str, gopls_version: &str) -> Result<Provi
             })
         }
     }
-    let binary = gobin.join("gopls");
-    if !binary.is_file() {
-        return Err(Error::Io {
-            path: binary.display().to_string(),
-            message: "`go install` succeeded but produced no binary".to_owned(),
-        });
-    }
+    let binary = gobin.join("gopls".to_owned() + EXE);
+    assert_executable(
+        &binary,
+        "`go install` succeeded but produced no executable binary",
+    )?;
     // gopls shells out to the `go` command for workspace introspection
     // (`go list`), so the wrapper pins both GOROOT and PATH to the
     // provisioned toolchain: serve-time environments rarely have Go.
+    // Batch file on Windows (untested there so far).
     let goroot = dir.join("toolchain/go");
-    let wrapper = gobin.join("server");
+    let wrapper = wrapper_path(&dir);
+    #[cfg(windows)]
+    let wrapper_text = {
+        let go_bin = goroot.join("bin").display().to_string().replace('/', "\\");
+        let exe = binary.display().to_string().replace('/', "\\");
+        "@echo off\r\nREM generated by `deepfunc provision`; do not edit.\r\nset \"GOROOT="
+            .to_owned()
+            + &goroot.display().to_string().replace('/', "\\")
+            + "\"\r\nset \"PATH="
+            + &go_bin
+            + ";%PATH%\"\r\n\""
+            + &exe
+            + "\" %*\r\n"
+    };
+    #[cfg(not(windows))]
     let wrapper_text =
         "#!/bin/sh\n# generated by `deepfunc provision`; do not edit.\nexec env GOROOT=\""
             .to_owned()
@@ -780,11 +951,19 @@ pub fn manifest_server(root: &Path, lang_id: &str) -> Option<(String, Vec<String
 
 /// Provision one language server. `version_override` replaces the pinned
 /// default. `root` is the servers root (each language gets a subdir).
+/// macOS is refused outright: no signing cert, no Mac hardware to verify
+/// on. A loud error beats an untested artifact.
 pub fn provision(
     lang_id: &str,
     version_override: Option<&str>,
     root: &Path,
 ) -> Result<ProvisionReport, Error> {
+    if cfg!(target_os = "macos") {
+        return Err(Error::Unsupported {
+            language: lang_id.to_owned(),
+            reason: "macOS is not supported: no signing certificate and no Mac hardware to verify on. This is deliberate, not an oversight.".to_owned(),
+        });
+    }
     match lang_id {
         "rust" => provision_rust(root, version_override.unwrap_or(RA_VERSION)),
         "go" => provision_go(root, GO_VERSION, version_override.unwrap_or(GOPLS_VERSION)),

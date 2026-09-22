@@ -453,25 +453,58 @@ fn lsp_inner(
     // model (and therefore symbol search) exists at all.
     if let Some(seed) = seed_file(root, lang.extensions) {
         if let Ok(text) = fs::read_to_string(&seed) {
-            let uri = format!("file://{}", seed.display());
-            client.did_open(&uri, lang.language_id, &text);
+            if let Ok(uri) = lsp::file_uri(&seed) {
+                client.did_open(&uri, lang.language_id, &text);
+            }
         }
     }
     client.ensure_index_ready();
     // Resolve the target to one hierarchy item.
     let (uri, line0, character) = if let Some((path, line0)) = parse_file_line(root, target) {
         let text = read_file(&path)?;
-        let uri = format!("file://{}", path.display());
+        let uri = lsp::file_uri(&path)?;
         client.did_open(&uri, lang.language_id, &text);
         // Servers resolve identifier positions reliably but NOT arbitrary
-        // body positions (verified: mid-body returns []). Map file:line to
-        // the enclosing symbol via documentSymbol, then reuse that position.
-        let symbols = client.document_symbols(&uri)?;
-        match innermost_callable(&symbols, line0) {
-            Some(symbol) => {
-                let (sel_line, sel_char) = symbol.sel_pos0();
-                (uri, sel_line, sel_char)
+        // body positions (verified: mid-body returns []), and symbol ranges
+        // include doc comments whose positions resolve to nothing (verified:
+        // range.start on a doc line returns null). So map file:line to a
+        // NAME via documentSymbol, then re-resolve through workspace/symbol
+        // whose positions are identifier-based — the same proven path as
+        // path targets.
+        let symbols = client.document_symbols(&uri, line0)?;
+        tracing::debug!(
+            count = symbols.len(),
+            line0,
+            "document symbols for target file"
+        );
+        let name = match innermost_callable(&symbols, line0) {
+            Some(symbol) => symbol.name.clone(),
+            None => {
+                return Err(Error::TargetNotFound {
+                    target: target.to_owned(),
+                    workspace: root.display().to_string(),
+                })
             }
+        };
+        tracing::debug!(name = name.as_str(), "file target mapped to symbol");
+        let candidates = client.workspace_symbols(&name)?;
+        let wanted = path.display().to_string();
+        let mut picked: Option<(String, u32, u32)> = None;
+        for symbol in &candidates {
+            if symbol.name() != name {
+                continue;
+            }
+            let same_file = match uri_to_path(symbol.uri()) {
+                Some(back) => back == wanted,
+                None => symbol.uri() == uri,
+            };
+            if same_file {
+                picked = Some((symbol.uri().to_owned(), symbol.line0(), symbol.char0()));
+                break;
+            }
+        }
+        match picked {
+            Some(entry) => entry,
             None => {
                 return Err(Error::TargetNotFound {
                     target: target.to_owned(),
@@ -535,7 +568,9 @@ fn lsp_inner(
         });
     }
     let target_item = &items[0];
+    tracing::debug!(name = target_item.name(), "target resolved");
     let incoming = client.incoming_calls(target_item)?;
+    tracing::info!(depth1 = incoming.len(), "direct callers found");
     let mut depth1: Vec<CallerEntry> = Vec::new();
     for call in incoming.iter().take(25) {
         let caller_uri = call.from().uri().to_owned();
@@ -603,6 +638,7 @@ fn run(argv: &[String]) -> Result<String, Error> {
         });
     }
     let target = parse_target(&args.target)?;
+    tracing::info!(target = target.as_str(), lang = lang.id, "deepfunc run");
     let root = find_workspace_root(&args.project, lang.markers)?;
     let depth1 = lsp_workspace(
         &root,
@@ -642,7 +678,26 @@ fn run(argv: &[String]) -> Result<String, Error> {
     Ok(markdown)
 }
 
+/// Install the stderr tracing subscriber. Level from DEEPFUNC_LOG
+/// (trace|debug|info|warn|error), default warn. Idempotent: late calls
+/// (tests) are ignored.
+fn init_logging() {
+    let level = std::env::var("DEEPFUNC_LOG").unwrap_or_default();
+    let max = match level.to_ascii_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "error" => tracing::Level::ERROR,
+        _ => tracing::Level::WARN,
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(max)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> ExitCode {
+    init_logging();
     let argv: Vec<String> = env::args().collect();
     if argv.get(1).is_some_and(|first| first == "provision") {
         return match run_provision(&argv) {

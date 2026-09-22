@@ -97,6 +97,12 @@ impl DeepFuncMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let bin = self.bin.clone();
         let budget = req.timeout_secs.unwrap_or(180).max(30);
+        tracing::info!(
+            target = req.target.as_str(),
+            project = req.project.as_str(),
+            budget,
+            "callers"
+        );
         let args = vec![
             "--project".to_owned(),
             req.project,
@@ -133,6 +139,7 @@ impl DeepFuncMcp {
         Parameters(req): Parameters<ProvisionReq>,
     ) -> Result<CallToolResult, ErrorData> {
         let bin = self.bin.clone();
+        tracing::info!(lang = req.lang.as_str(), "provision");
         let mut args = vec!["provision".to_owned(), "--lang".to_owned(), req.lang];
         if let Some(version) = req.version {
             args.push("--version".to_owned());
@@ -167,8 +174,26 @@ pub struct ProvisionReq {
     pub dir: Option<String>,
 }
 
+/// Install the stderr tracing subscriber. Level from DEEPFUNC_LOG
+/// (trace|debug|info|warn|error), default warn.
+fn init_logging() {
+    let level = std::env::var("DEEPFUNC_LOG").unwrap_or_default();
+    let max = match level.to_ascii_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "error" => tracing::Level::ERROR,
+        _ => tracing::Level::WARN,
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(max)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() {
+    init_logging();
     use rmcp::{transport::stdio, ServiceExt};
     let bin = std::env::var("DEEPFUNC_BIN").unwrap_or_else(|_| "deepfunc-cli".to_owned());
     let service = DeepFuncMcp { bin };

@@ -64,10 +64,11 @@ pub struct IncomingCall {
 }
 
 /// One node of a `textDocument/documentSymbol` tree. Only position data
-/// is kept: names come from hierarchy items. (Unknown JSON fields such as
-/// `name` are ignored on decode.)
+/// plus the name (for re-resolution via workspace/symbol, whose positions
+/// are identifier-based) are kept.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DocumentSymbol {
+    pub name: String,
     pub kind: u32,
     pub range: Range,
     #[serde(rename = "selectionRange")]
@@ -188,7 +189,7 @@ impl LanguageClient {
         language: &str,
         install_hint: &str,
     ) -> Result<Self, Error> {
-        let root_uri = format!("file://{}", root.display());
+        let root_uri = file_uri(root)?;
         let command_line = if args.is_empty() {
             program.to_owned()
         } else {
@@ -349,6 +350,7 @@ impl LanguageClient {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, Error> {
+        let started = Instant::now();
         let id = self.next_id;
         self.next_id += 1;
         let message = RpcRequest {
@@ -371,18 +373,39 @@ impl LanguageClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                tracing::warn!(
+                    method,
+                    timeout_secs = self.timeout_secs,
+                    "lsp request timed out"
+                );
                 return Err(self.fail(method, "timed out waiting for a response".to_owned()));
             }
             match self.events.recv_timeout(remaining) {
                 Ok(ClientEvent::Response { id: got, result }) => {
                     if got == id {
                         if result.get("error").is_some() {
+                            tracing::debug!(
+                                method,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "lsp request returned error"
+                            );
                             return Err(self.fail(method, result.to_string()));
                         }
+                        tracing::debug!(
+                            method,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            bytes = result.to_string().len(),
+                            "lsp request ok"
+                        );
                         return Ok(result);
                     }
                 }
                 Err(_) => {
+                    tracing::warn!(
+                        method,
+                        timeout_secs = self.timeout_secs,
+                        "lsp request timed out"
+                    );
                     return Err(self.fail(method, "timed out waiting for a response".to_owned()));
                 }
             }
@@ -415,6 +438,7 @@ impl LanguageClient {
                 Ok(None) => Vec::new(),
                 Ok(Some(symbols)) => symbols,
                 Err(error) => {
+                    tracing::debug!(query, "symbol decode failed");
                     return Err(self.fail(
                         "workspace/symbol",
                         "failed to decode symbols: ".to_owned() + &error.to_string(),
@@ -430,33 +454,51 @@ impl LanguageClient {
     /// Wait until the symbol index is loaded, using a canary query that
     /// matches in virtually every workspace. Polls until the canary answer
     /// is non-empty AND unchanged across two polls, or 30s budget.
-    /// Errors count as not-ready (some servers fail queries while their
-    /// project model loads). Returns true when the index looks ready. Call
-    /// once after spawn; after this, an empty target lookup means
-    /// genuinely unknown.
+    /// Stability is measured on the RAW symbol count (unfiltered): the
+    /// canary matches mostly namespaces/structs, so a callable-only count
+    /// can sit empty on a fully loaded index. Errors count as not-ready
+    /// (some servers fail queries while their project model loads).
+    /// Returns true when the index looks ready. Call once after spawn;
+    /// after this, an empty target lookup means genuinely unknown.
     pub fn ensure_index_ready(&mut self) -> bool {
         let start = Instant::now();
         let budget = Duration::from_secs(30);
         let mut last_count: Option<usize> = None;
         loop {
-            match self.request_symbols("a") {
-                Ok(functions) => {
+            match self.request_symbol_total("a") {
+                Ok(total) => {
                     if self.is_quiescent() {
+                        tracing::info!("index ready: quiescent");
                         return true;
                     }
-                    if !functions.is_empty() && last_count == Some(functions.len()) {
+                    if total > 0 && last_count == Some(total) {
+                        tracing::info!(symbols = total, "index ready: stable");
                         return true;
                     }
-                    last_count = Some(functions.len());
+                    last_count = Some(total);
                 }
                 Err(_) => {
                     last_count = None;
                 }
             }
             if start.elapsed() >= budget {
+                tracing::warn!("index readiness budget exhausted; proceeding unguarded");
                 return self.is_quiescent();
             }
             std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Raw symbol count for one query (no kind filter): readiness signal.
+    fn request_symbol_total(&mut self, query: &str) -> Result<usize, Error> {
+        let result = self.request("workspace/symbol", json!({"query": query}))?;
+        match serde_json::from_value::<Option<Vec<SymbolInfo>>>(result) {
+            Ok(None) => Ok(0),
+            Ok(Some(symbols)) => Ok(symbols.len()),
+            Err(error) => Err(self.fail(
+                "workspace/symbol",
+                "failed to decode symbols: ".to_owned() + &error.to_string(),
+            )),
         }
     }
 
@@ -486,12 +528,43 @@ impl LanguageClient {
 
     /// Hierarchical symbols of one open document. Servers answer
     /// `DocumentSymbol[]` or (older) flat `SymbolInformation[]`; both are
-    /// normalized to a tree.
-    pub fn document_symbols(&mut self, uri: &str) -> Result<Vec<DocumentSymbol>, Error> {
-        let result = self.request(
-            "textDocument/documentSymbol",
-            json!({"textDocument": {"uri": uri}}),
-        )?;
+    /// normalized to a tree. Polls until some symbol spans `line0` (a
+    /// loading server answers PARTIAL trees that pass a non-empty check
+    /// while missing the target), or quiescent, or 30s budget.
+    pub fn document_symbols(
+        &mut self,
+        uri: &str,
+        line0: u32,
+    ) -> Result<Vec<DocumentSymbol>, Error> {
+        let start = Instant::now();
+        let budget = Duration::from_secs(30);
+        loop {
+            let result = self.request(
+                "textDocument/documentSymbol",
+                json!({"textDocument": {"uri": uri}}),
+            )?;
+            let symbols = self.decode_symbols(result)?;
+            if innermost_callable(&symbols, line0).is_some()
+                || self.is_quiescent()
+                || start.elapsed() >= budget
+            {
+                tracing::debug!(
+                    count = symbols.len(),
+                    elapsed_s = start.elapsed().as_secs(),
+                    "document symbols resolved"
+                );
+                return Ok(symbols);
+            }
+            tracing::debug!(
+                count = symbols.len(),
+                elapsed_s = start.elapsed().as_secs(),
+                "document symbols partial; waiting for target line"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    fn decode_symbols(&self, result: Value) -> Result<Vec<DocumentSymbol>, Error> {
         if let Ok(symbols) = serde_json::from_value::<Option<Vec<DocumentSymbol>>>(result.clone()) {
             return Ok(symbols.unwrap_or_default());
         }
@@ -501,6 +574,7 @@ impl LanguageClient {
                 .into_iter()
                 .filter(|info| is_callable(info.kind))
                 .map(|info| DocumentSymbol {
+                    name: info.name,
                     kind: info.kind,
                     range: info.location.range.clone(),
                     selection_range: info.location.range,
@@ -580,6 +654,7 @@ impl LanguageClient {
                         ));
                     }
                 };
+            tracing::debug!(callers = calls.len(), "incoming calls");
             if !calls.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
                 return Ok(calls);
             }
@@ -675,41 +750,32 @@ impl DocumentSymbol {
     }
 }
 
-/// Convert a `file://` URI to a filesystem path. Handles the common
-/// percent-escapes; returns `None` for non-file URIs.
-pub fn uri_to_path(uri: &str) -> Option<String> {
-    let stripped = uri.strip_prefix("file://")?;
-    let mut out = String::with_capacity(stripped.len());
-    let bytes = stripped.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
-                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                out.push((high * 16 + low) as char);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index] as char);
-        index += 1;
+/// Convert a filesystem path to a `file://` URI. Handles drive letters,
+/// backslashes, and percent-encoding per platform via the `url` crate.
+pub fn file_uri(path: &Path) -> Result<String, Error> {
+    match url::Url::from_file_path(path) {
+        Ok(url) => Ok(url.to_string()),
+        Err(()) => Err(Error::Io {
+            path: path.display().to_string(),
+            message: "cannot convert path to a file:// URI".to_owned(),
+        }),
     }
-    Some(out)
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+/// Convert a `file://` URI to a filesystem path. Returns `None` for
+/// non-file URIs or unrepresentable paths.
+pub fn uri_to_path(uri: &str) -> Option<String> {
+    let url = url::Url::parse(uri).ok()?;
+    url.to_file_path()
+        .ok()?
+        .to_str()
+        .map(|path| path.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{innermost_callable, is_callable, uri_to_path, DocumentSymbol, Position, Range};
+    use std::path::Path;
 
     fn span(start: u32, end: u32) -> Range {
         Range {
@@ -724,8 +790,15 @@ mod tests {
         }
     }
 
-    fn symbol(kind: u32, start: u32, end: u32, children: Vec<DocumentSymbol>) -> DocumentSymbol {
+    fn symbol(
+        name: &str,
+        kind: u32,
+        start: u32,
+        end: u32,
+        children: Vec<DocumentSymbol>,
+    ) -> DocumentSymbol {
         DocumentSymbol {
+            name: name.to_owned(),
             kind,
             range: span(start, end),
             selection_range: span(start, end),
@@ -748,15 +821,16 @@ mod tests {
     fn innermost_callable_descends_and_skips_modules() {
         let tree = vec![
             symbol(
+                "mod",
                 2,
                 0,
                 30,
                 vec![
-                    symbol(12, 5, 20, vec![symbol(6, 10, 15, vec![])]),
-                    symbol(5, 22, 25, vec![]),
+                    symbol("outer", 12, 5, 20, vec![symbol("inner", 6, 10, 15, vec![])]),
+                    symbol("plain", 5, 22, 25, vec![]),
                 ],
             ),
-            symbol(12, 40, 45, vec![]),
+            symbol("other", 12, 40, 45, vec![]),
         ];
         let found = innermost_callable(&tree, 12);
         assert!(found.is_some());
@@ -792,7 +866,22 @@ mod tests {
         assert_eq!(uri_to_path("file:///a%2Fb.rs"), Some("/a/b.rs".to_owned()));
         assert!(uri_to_path("https://example.com/a.rs").is_none());
         assert!(uri_to_path("not-a-uri").is_none());
-        assert!(uri_to_path("file://").is_some());
+        assert!(uri_to_path("").is_none());
+    }
+
+    #[test]
+    fn file_uri_roundtrips_paths() {
+        let uri = super::file_uri(Path::new("/home/u/proj/main.rs"));
+        assert!(uri.is_ok());
+        if let Ok(uri) = uri {
+            assert_eq!(uri_to_path(&uri), Some("/home/u/proj/main.rs".to_owned()));
+        }
+        let spaced = super::file_uri(Path::new("/home/my dir/a.rs"));
+        assert!(spaced.is_ok());
+        if let Ok(spaced) = spaced {
+            assert!(spaced.contains("%20"));
+            assert_eq!(uri_to_path(&spaced), Some("/home/my dir/a.rs".to_owned()));
+        }
     }
 
     #[test]
