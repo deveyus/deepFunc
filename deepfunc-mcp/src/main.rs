@@ -1,13 +1,20 @@
-//! deepFunc MCP server — one tool (`callers`) over the deepfunc-cli binary.
+//! deepFunc MCP server — `callers` + `provision` over the deepfunc-cli binary.
 //!
 //! Transport is stdio; spawn from an MCP client (see `~/mcp/deepfunc/run.sh`).
-//! The rust-analyzer run is blocking and slow, so each call executes the CLI
+//! Language-server runs are blocking and slow, so each call executes the CLI
 //! in `spawn_blocking` under a tool-level timeout. The CLI binary is located
 //! via `DEEPFUNC_BIN`, falling back to `deepfunc-cli` on PATH.
+//!
+//! Result shapes follow rmcp's guidance: success is unstructured text
+//! (no `structuredContent`, which chokes record-expecting clients);
+//! CLI failures (the typed E01–E08 errors) come back as TOOL-level errors
+//! so the diagnostics stay visible instead of rendering as opaque -32603.
+//! Only infrastructure failures (spawn, join, timeout) are protocol errors.
 
 #![forbid(unsafe_code)]
 
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars;
 use rmcp::{tool, tool_router, ErrorData};
 use serde::Deserialize;
@@ -35,11 +42,18 @@ fn fail(message: String) -> ErrorData {
     ErrorData::internal_error(message, None)
 }
 
-fn run_cli(bin: &str, args: &[String]) -> Result<String, ErrorData> {
+/// CLI outcome split for tool-level reporting: stdout on success,
+/// stderr (typed E-codes) as a VISIBLE tool error on failure.
+enum CliOutcome {
+    ToolError(String),
+    InfraError(String),
+}
+
+fn run_cli(bin: &str, args: &[String]) -> Result<String, CliOutcome> {
     let output = match std::process::Command::new(bin).args(args).output() {
         Ok(output) => output,
         Err(error) => {
-            return Err(fail(
+            return Err(CliOutcome::InfraError(
                 "failed to spawn deepfunc-cli (".to_owned()
                     + bin
                     + "): "
@@ -51,7 +65,19 @@ fn run_cli(bin: &str, args: &[String]) -> Result<String, ErrorData> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        Err(fail(String::from_utf8_lossy(&output.stderr).into_owned()))
+        Err(CliOutcome::ToolError(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+fn into_tool_result(outcome: Result<String, CliOutcome>) -> Result<CallToolResult, ErrorData> {
+    match outcome {
+        Ok(report) => Ok(CallToolResult::success(vec![ContentBlock::text(report)])),
+        Err(CliOutcome::ToolError(message)) => {
+            Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
+        }
+        Err(CliOutcome::InfraError(message)) => Err(fail(message)),
     }
 }
 
@@ -68,10 +94,10 @@ impl DeepFuncMcp {
     async fn callers(
         &self,
         Parameters(req): Parameters<CallersReq>,
-    ) -> Result<Json<String>, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         let bin = self.bin.clone();
         let budget = req.timeout_secs.unwrap_or(180).max(30);
-        let mut args = vec![
+        let args = vec![
             "--project".to_owned(),
             req.project,
             "--target".to_owned(),
@@ -84,16 +110,16 @@ impl DeepFuncMcp {
         let worker = tokio::task::spawn_blocking(move || run_cli(&bin, &args));
         match tokio::time::timeout(Duration::from_secs(budget), worker).await {
             Ok(joined) => match joined {
-                Ok(result) => result.map(Json),
+                Ok(outcome) => into_tool_result(outcome),
                 Err(error) => Err(fail(
                     "deepfunc worker failed: ".to_owned() + &error.to_string(),
                 )),
             },
-            Err(_) => Err(fail(
+            Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 "deepfunc call timed out after ".to_owned()
                     + &budget.to_string()
                     + "s. Retry with a larger timeout_secs.",
-            )),
+            )])),
         }
     }
 
@@ -105,7 +131,7 @@ impl DeepFuncMcp {
     async fn provision(
         &self,
         Parameters(req): Parameters<ProvisionReq>,
-    ) -> Result<Json<String>, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         let bin = self.bin.clone();
         let mut args = vec!["provision".to_owned(), "--lang".to_owned(), req.lang];
         if let Some(version) = req.version {
@@ -119,14 +145,14 @@ impl DeepFuncMcp {
         let worker = tokio::task::spawn_blocking(move || run_cli(&bin, &args));
         match tokio::time::timeout(Duration::from_secs(900), worker).await {
             Ok(joined) => match joined {
-                Ok(result) => result.map(Json),
+                Ok(outcome) => into_tool_result(outcome),
                 Err(error) => Err(fail(
                     "deepfunc worker failed: ".to_owned() + &error.to_string(),
                 )),
             },
-            Err(_) => Err(fail(
+            Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 "provision timed out after 900s. Retry; downloads resume partially (npm/go caches, rerun overwrites).".to_owned(),
-            )),
+            )])),
         }
     }
 }

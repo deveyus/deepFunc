@@ -83,7 +83,7 @@ impl Display for Error {
             ),
             Self::TargetNotFound { target, workspace } => write!(
                 f,
-                "error[E04]: target definition not found\n --> workspace: {workspace}\n  |\n  | note: symbol index was ready; `workspace/symbol` and `prepareCallHierarchy` found no definition for `{target}`\n  | help: suspected cause: wrong name or module path. Check spelling; for trait impls use the fully-qualified path; for `file.rs:line` targets confirm the line sits on (or just above) the `fn` item"
+                "error[E04]: target definition not found\n --> workspace: {workspace}\n  |\n  | note: `workspace/symbol` and `prepareCallHierarchy` found no definition for `{target}` after the readiness wait\n  | help: suspected cause: wrong name or module path. Check spelling; for trait impls use the fully-qualified path; for `file.rs:line` targets confirm the line sits on (or just above) the `fn` item. If the workspace itself failed to load (missing toolchain on PATH), fix that first."
             ),
             Self::RequestFailed {
                 server,

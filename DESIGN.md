@@ -13,6 +13,12 @@ Three crates: `deepfunc-core` (lib, pure call-graph logic + formatting),
 (bin, rmcp stdio server with one `callers` tool that shells out to the CLI
 via `DEEPFUNC_BIN`). Core stays pure. CLI owns LSP. MCP owns protocol.
 
+Result shapes follow rmcp's guidance: success is unstructured text
+(no `structuredContent`, which chokes record-expecting clients);
+CLI failures (the typed E01–E08 errors) come back as TOOL-level errors
+so the diagnostics stay visible instead of rendering as opaque -32603.
+Only infrastructure failures (spawn, join, timeout) are protocol errors.
+
 ## 2b. Languages (rust, python, go; typescript blocked)
 
 One `Language` table in `deepfunc-cli`: server command, LSP language ID,
