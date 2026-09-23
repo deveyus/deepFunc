@@ -79,10 +79,18 @@ pub fn language(id: &str) -> Result<&'static Language, Error> {
     }
 }
 
-/// Default servers root: `$XDG_DATA_HOME/deepfunc/servers`, falling back
-/// to `~/.local/share/deepfunc/servers`, and on Windows to
-/// `%LOCALAPPDATA%/deepfunc/servers`.
+/// Default servers root: on Windows `%LOCALAPPDATA%/deepfunc/servers`
+/// (the native per-user data dir, always present — checked first so
+/// git-bash's `$HOME` cannot split installs across shells); elsewhere
+/// `$XDG_DATA_HOME/deepfunc/servers`, falling back to
+/// `~/.local/share/deepfunc/servers`.
 pub fn default_servers_dir() -> Result<PathBuf, Error> {
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return Ok(PathBuf::from(local).join("deepfunc/servers"));
+        }
+    }
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("deepfunc/servers"));
@@ -91,12 +99,6 @@ pub fn default_servers_dir() -> Result<PathBuf, Error> {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
             return Ok(PathBuf::from(home).join(".local/share/deepfunc/servers"));
-        }
-    }
-    #[cfg(windows)]
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        if !local.is_empty() {
-            return Ok(PathBuf::from(local).join("deepfunc/servers"));
         }
     }
     Err(Error::Io {
@@ -809,6 +811,41 @@ mod tests {
         let root = Path::new("/w");
         assert_eq!(display_path(root, Path::new("/w/a.rs")), "a.rs");
         assert_eq!(display_path(root, Path::new("/other/a.rs")), "/other/a.rs");
+    }
+
+    /// Windows must prefer the native per-user data dir even when a
+    /// unix-style `$HOME` exists (git-bash sets one). This is the only
+    /// test touching process env; no other test reads these variables.
+    /// Runs only on Windows: elsewhere `HOME` legitimately wins.
+    #[cfg(windows)]
+    #[test]
+    fn windows_servers_dir_prefers_localappdata() {
+        let saved = (
+            std::env::var("LOCALAPPDATA").ok(),
+            std::env::var("XDG_DATA_HOME").ok(),
+            std::env::var("HOME").ok(),
+        );
+        std::env::set_var("LOCALAPPDATA", "C:\\Users\\t\\AppData\\Local");
+        std::env::set_var("XDG_DATA_HOME", "C:\\Users\\t\\xdg");
+        std::env::set_var("HOME", "C:\\Users\\t");
+        let dir = super::default_servers_dir();
+        match &saved {
+            (Some(value), _, _) => std::env::set_var("LOCALAPPDATA", value),
+            (None, _, _) => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match &saved {
+            (_, Some(value), _) => std::env::set_var("XDG_DATA_HOME", value),
+            (_, None, _) => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &saved {
+            (_, _, Some(value)) => std::env::set_var("HOME", value),
+            (_, _, None) => std::env::remove_var("HOME"),
+        }
+        assert!(dir.is_ok());
+        if let Ok(dir) = dir {
+            assert!(dir.ends_with("deepfunc/servers"));
+            assert!(dir.starts_with("C:\\Users\\t\\AppData\\Local"));
+        }
     }
 
     #[test]
