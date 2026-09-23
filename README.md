@@ -133,7 +133,8 @@ See `dev-scripts/deploy.sh` for the dev/prod split behind the
 author's own setup, which keeps server startup in milliseconds.
 `acquire` takes 30–60s+ for language server load — raise the client
 MCP timeout (`experimental.mcp_timeout`) past that, then enjoy warm
-`callers` after.
+`callers` after. Agent usage pattern (TTL picks, error routing):
+`FOR-AGENTS.md`.
 
 ## Errors
 

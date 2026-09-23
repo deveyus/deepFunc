@@ -460,7 +460,7 @@ impl DeepFuncMcp {
     /// answer in seconds. Without a holding this fails loudly — it will
     /// not cold-spawn on your behalf because it cannot pick a TTL for you.
     #[tool(
-        description = "Caller context for a function (depth-1 bodies, depth-2 signatures) as markdown. Requires an acquired holding: call acquire first. Params: project (workspace dir), target (path.to.fn or file.ext:line), lang (rust|python|go, default rust), timeout_secs (default 180)."
+        description = "Caller context for a function: depth-1 bodies, depth-2 signatures, as markdown. Needs an acquire holding first. Params: project, target (path::to::fn or file.ext:line), lang (default rust), timeout_secs (default 180)."
     )]
     async fn callers(
         &self,
@@ -498,7 +498,7 @@ impl DeepFuncMcp {
     /// index in seconds. Re-acquire to extend. Reports the holding's RSS
     /// plus system free/total so retention stays an informed choice.
     #[tool(
-        description = "Acquire (warm + pin) a workspace language server. Params: project (workspace dir), lang (rust|python|go, default rust), ttl_secs REQUIRED seconds to hold after last use (1800 suggested for active work), timeout_secs (default 180). Re-acquire to extend TTL. Reports memory held + system free/total."
+        description = "Warm a workspace server and pin it for ttl_secs (REQUIRED, 1800 suggested). First call is slow (index load). Re-acquire to extend. Params: project, lang (default rust), ttl_secs, timeout_secs (default 180)."
     )]
     async fn acquire(
         &self,
@@ -540,7 +540,7 @@ impl DeepFuncMcp {
     /// Drop holdings now instead of waiting out their TTL. Omit project
     /// to release everything held.
     #[tool(
-        description = "Release held language servers now. Params: project (omit for all), lang (omit with project for all its languages). Reports what was dropped."
+        description = "Drop warmed servers now (else they self-expire after TTL). Params: project (omit for all), lang (omit for all languages)."
     )]
     async fn release(
         &self,
@@ -565,7 +565,7 @@ impl DeepFuncMcp {
     /// Download a language server when E01 says it is missing. SLOW
     /// (minutes for first downloads): raise the client MCP timeout.
     #[tool(
-        description = "Download a language server (rust|python|typescript|go) into a directory. Params: lang, version (optional pin override), dir (optional servers root). Prints the binary path; use it with callers via --server-bin. SLOW minutes on first download: raise client mcp_timeout."
+        description = "Download a pinned language server (rust|python|go). Slow on first run (minutes). Params: lang, version (optional pin override), dir (optional servers root)."
     )]
     async fn provision(
         &self,
