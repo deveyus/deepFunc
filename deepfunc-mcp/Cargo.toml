@@ -15,5 +15,9 @@ sysinfo = "0.32"
 deepfunc-cli = { path = "../deepfunc-cli" }
 deepfunc-core = { path = "../deepfunc-core" }
 
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+
 [lints]
 workspace = true

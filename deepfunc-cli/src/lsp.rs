@@ -176,6 +176,11 @@ pub struct LanguageClient {
     next_id: i64,
     child: Option<Child>,
     timeout_secs: u64,
+    // True once ensure_index_ready proved a loaded index. Warm calls
+    // skip the canary and trust single-shot answers: retries that save
+    // cold loads only burn budgets on warm ones (measured: a warm
+    // multi-caller report cost 24s, nearly all of it retry sleeps).
+    warmed: bool,
 }
 
 impl LanguageClient {
@@ -311,6 +316,7 @@ impl LanguageClient {
             next_id: 1,
             child: Some(child),
             timeout_secs,
+            warmed: false,
         };
         let params = json!({
             "processId": std::process::id(),
@@ -476,6 +482,9 @@ impl LanguageClient {
     /// Returns true when the index looks ready. Call once after spawn;
     /// after this, an empty target lookup means genuinely unknown.
     pub fn ensure_index_ready(&mut self) -> bool {
+        if self.warmed {
+            return true;
+        }
         let start = Instant::now();
         let budget = Duration::from_secs(30);
         let mut last_count: Option<usize> = None;
@@ -484,10 +493,12 @@ impl LanguageClient {
                 Ok(total) => {
                     if self.is_quiescent() {
                         tracing::info!("index ready: quiescent");
+                        self.warmed = true;
                         return true;
                     }
                     if total > 0 && last_count == Some(total) {
                         tracing::info!(symbols = total, "index ready: stable");
+                        self.warmed = true;
                         return true;
                     }
                     last_count = Some(total);
@@ -522,6 +533,11 @@ impl LanguageClient {
     /// request, then short retries (empty AND errored — a freshly loading
     /// project fails queries before it serves them), then trust the answer.
     pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<SymbolInfo>, Error> {
+        // Warm index, single shot: empty means genuinely no match.
+        // The retry loop below exists for cold loads only.
+        if self.warmed {
+            return self.request_symbols(query);
+        }
         let start = Instant::now();
         let budget = Duration::from_secs(20);
         loop {
@@ -551,6 +567,15 @@ impl LanguageClient {
         uri: &str,
         line0: u32,
     ) -> Result<Vec<DocumentSymbol>, Error> {
+        // Warm index, single shot: a partial tree means the position is
+        // genuinely outside any callable (doc comments resolve null).
+        if self.warmed {
+            let result = self.request(
+                "textDocument/documentSymbol",
+                json!({"textDocument": {"uri": uri}}),
+            )?;
+            return self.decode_symbols(result);
+        }
         let start = Instant::now();
         let budget = Duration::from_secs(30);
         loop {
@@ -612,31 +637,43 @@ impl LanguageClient {
         line0: u32,
         character: u32,
     ) -> Result<Vec<HierarchyItem>, Error> {
+        // Warm index, single shot: empty means no symbol here.
+        // The backstop loop below exists for cold-load reanalysis races.
+        if self.warmed {
+            return self.prepare_once(uri, line0, character);
+        }
         let start = Instant::now();
         let budget = Duration::from_secs(5);
         loop {
-            let result = self.request(
-                "textDocument/prepareCallHierarchy",
-                json!({"textDocument": {"uri": uri},
-                       "position": {"line": line0, "character": character}}),
-            )?;
-            let items: Vec<HierarchyItem> =
-                match serde_json::from_value::<Option<Vec<HierarchyItem>>>(result) {
-                    // Servers answer `null` (not `[]`) when the position
-                    // resolves to no symbol. Empty, not a protocol error.
-                    Ok(None) => Vec::new(),
-                    Ok(Some(items)) => items,
-                    Err(error) => {
-                        return Err(self.fail(
-                            "textDocument/prepareCallHierarchy",
-                            "failed to decode hierarchy: ".to_owned() + &error.to_string(),
-                        ));
-                    }
-                };
+            let items = self.prepare_once(uri, line0, character)?;
             if !items.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
                 return Ok(items);
             }
             std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// One prepare attempt: shared by the warm fast path and the cold loop.
+    fn prepare_once(
+        &mut self,
+        uri: &str,
+        line0: u32,
+        character: u32,
+    ) -> Result<Vec<HierarchyItem>, Error> {
+        let result = self.request(
+            "textDocument/prepareCallHierarchy",
+            json!({"textDocument": {"uri": uri},
+                   "position": {"line": line0, "character": character}}),
+        )?;
+        match serde_json::from_value::<Option<Vec<HierarchyItem>>>(result) {
+            // Servers answer `null` (not `[]`) when the position
+            // resolves to no symbol. Empty, not a protocol error.
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(items)) => Ok(items),
+            Err(error) => Err(self.fail(
+                "textDocument/prepareCallHierarchy",
+                "failed to decode hierarchy: ".to_owned() + &error.to_string(),
+            )),
         }
     }
 
@@ -653,27 +690,37 @@ impl LanguageClient {
                 ));
             }
         };
+        // Warm index, single shot: empty means genuinely no callers.
+        // The backstop loop below exists for cold-load reanalysis races.
+        if self.warmed {
+            return self.incoming_once(&item_value);
+        }
         let start = Instant::now();
         let budget = Duration::from_secs(5);
         loop {
-            let result =
-                self.request("callHierarchy/incomingCalls", json!({"item": item_value}))?;
-            let calls: Vec<IncomingCall> =
-                match serde_json::from_value::<Option<Vec<IncomingCall>>>(result) {
-                    Ok(None) => Vec::new(),
-                    Ok(Some(calls)) => calls,
-                    Err(error) => {
-                        return Err(self.fail(
-                            "callHierarchy/incomingCalls",
-                            "failed to decode callers: ".to_owned() + &error.to_string(),
-                        ));
-                    }
-                };
+            let calls = self.incoming_once(&item_value)?;
             tracing::debug!(callers = calls.len(), "incoming calls");
             if !calls.is_empty() || self.is_quiescent() || start.elapsed() >= budget {
                 return Ok(calls);
             }
             std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// One incoming-calls attempt: shared by the warm fast path and the
+    /// cold loop.
+    fn incoming_once(
+        &mut self,
+        item_value: &serde_json::Value,
+    ) -> Result<Vec<IncomingCall>, Error> {
+        let result = self.request("callHierarchy/incomingCalls", json!({"item": item_value}))?;
+        match serde_json::from_value::<Option<Vec<IncomingCall>>>(result) {
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(calls)) => Ok(calls),
+            Err(error) => Err(self.fail(
+                "callHierarchy/incomingCalls",
+                "failed to decode callers: ".to_owned() + &error.to_string(),
+            )),
         }
     }
 

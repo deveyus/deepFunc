@@ -460,7 +460,7 @@ impl DeepFuncMcp {
     /// answer in seconds. Without a holding this fails loudly — it will
     /// not cold-spawn on your behalf because it cannot pick a TTL for you.
     #[tool(
-        description = "Caller context for a function: depth-1 bodies, depth-2 signatures, as markdown. Needs an acquire holding first. Params: project, target (path::to::fn or file.ext:line), lang (default rust), timeout_secs (default 180)."
+        description = "Caller context for a function: depth-1 bodies, depth-2 signatures, as markdown. Needs an acquire holding first. Blind to dynamic dispatch (empty is inconclusive there). Params: project, target (path::to::fn or file.ext:line), lang (default rust), timeout_secs (default 180)."
     )]
     async fn callers(
         &self,
