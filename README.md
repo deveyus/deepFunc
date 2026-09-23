@@ -38,33 +38,59 @@ C++ is not planned.
 
 ## Install
 
-Prebuilt binaries ride each
-[GitHub release](https://github.com/deveyus/deepFunc/releases)
-(static Linux musl + Windows MSVC; macOS is unsupported — provision
-refuses darwin). Unpack, then provision the pinned language servers:
+You need two binaries (`deepfunc-cli` for the terminal, `deepfunc-mcp`
+for agents) plus one provisioned language server per language you use.
+deepFunc fetches the servers itself — no `go`, `npm`, or `curl`
+required.
+
+### Option A — prebuilt binaries
+
+Grab the archive for your platform from
+[GitHub releases](https://github.com/deveyus/deepFunc/releases):
+
+| Platform | Archive | Notes |
+|----------|---------|-------|
+| Linux x86_64 | `deepfunc-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` | Fully static; runs anywhere |
+| Windows x86_64 | `deepfunc-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Builds + unit tests pass in CI; live-server paths not yet exercised on real Windows — report what you find |
+| macOS | — | Unsupported: `provision` refuses darwin, and there is no CI coverage. The code is platform-branched and *should* work, but nobody has proven it |
 
 ```bash
-./deepfunc-cli provision --all
+# Linux
+tar xzf deepfunc-*.tar.gz
+sudo install -m755 deepfunc-cli deepfunc-mcp /usr/local/bin/
 ```
 
-Or build from source. No helpers required — no `go`, `npm`, or
-`curl` needed. deepFunc downloads everything itself, hash-verified:
+On Windows, unzip next to each other (e.g. `C:\tools\deepfunc\`) and
+add that folder to `PATH` — the MCP server finds the CLI on `PATH`,
+or via a `DEEPFUNC_BIN` environment variable pointing at it.
+
+### Option B — build from source
 
 ```bash
-cargo build --release -p deepfunc-cli
-./target/release/deepfunc-cli provision --all
+cargo build --release -p deepfunc-cli -p deepfunc-mcp
 ```
 
-This installs pinned language servers into `~/.local/share/deepfunc/servers`
-(plus a shared node runtime for the JS servers). On NixOS, rust-analyzer
-cannot run as a generic-linux binary, so provision points you at nix
-instead of wasting the download. See `DESIGN.md` §2d for sources and pins.
-
-For development (linted, verified, benchmarked), use the Nix flake:
+### Provision the language servers
 
 ```bash
-nix develop . --command bash dev-scripts/gate.sh
+deepfunc-cli provision --all        # everything
+deepfunc-cli provision --lang rust  # or one language: rust, python, go
 ```
+
+This downloads pinned servers, hash-verified over TLS, into
+`~/.local/share/deepfunc/servers` on Linux and
+`%LOCALAPPDATA%\deepfunc\servers` on Windows (plus a shared node
+runtime for the JS-based servers). Re-run any time to repair or
+upgrade. On NixOS, rust-analyzer cannot run as a generic-linux
+binary, so provision points you at nix instead of wasting the
+download. See `DESIGN.md` §2d for sources and pins.
+
+Two honest expectations: the first `callers` on a project waits out
+the language server's index load (30–60s+ on large workspaces — that
+is the server, not deepFunc), and each resident server holds real
+memory (a rust-analyzer holding measured ~1.6 GB RSS). The MCP
+`acquire` call reports both numbers so you can decide how long to
+keep a session warm.
 
 ## Usage
 
@@ -85,25 +111,29 @@ deepfunc --project . --lang python --server-bin /path/to/pyright-langserver --st
 
 ## MCP
 
-deepFunc ships an MCP server (`deepfunc-mcp`, tools `callers` +
-`provision`) for agents. With opencode:
+deepFunc ships an MCP server (`deepfunc-mcp`) for agents, with four
+tools: `acquire` (warm a project and pin it for a TTL you choose),
+`callers` (the report, served from the warm holding), `release`
+(drop it early), and `provision` (fetch servers). With opencode,
+pointing at release binaries on your `PATH`:
 
 ```json
 {
   "mcp": {
     "deepfunc": {
       "type": "local",
-      "command": ["~/mcp/deepfunc/run.sh"],
+      "command": ["deepfunc-mcp"],
       "enabled": true
     }
   }
 }
 ```
 
-See `dev-scripts/deploy.sh` for the dev/prod split that
-keeps server startup in milliseconds. Cold calls take 30–60s for language
-server load — raise the client MCP timeout (`experimental.mcp_timeout`)
-if calls time out.
+See `dev-scripts/deploy.sh` for the dev/prod split behind the
+author's own setup, which keeps server startup in milliseconds.
+`acquire` takes 30–60s+ for language server load — raise the client
+MCP timeout (`experimental.mcp_timeout`) past that, then enjoy warm
+`callers` after.
 
 ## Errors
 
