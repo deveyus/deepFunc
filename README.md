@@ -133,8 +133,7 @@ See `dev-scripts/deploy.sh` for the dev/prod split behind the
 author's own setup, which keeps server startup in milliseconds.
 `acquire` takes 30–60s+ for language server load — raise the client
 MCP timeout (`experimental.mcp_timeout`) past that, then enjoy warm
-`callers` after. Agent usage pattern (TTL picks, error routing):
-`FOR-AGENTS.md`.
+`callers` after.
 
 ## Errors
 
@@ -162,3 +161,23 @@ deny both.
 ## License
 
 LGPL-3.0-or-later. See `LICENSE`.
+
+## For agents
+
+Paste into your `AGENTS.md` when deepFunc is installed:
+
+```markdown
+## deepFunc (caller context)
+
+Lifecycle: `acquire` once per workspace, `callers` per question,
+`release` when done (holdings self-expire after TTL otherwise).
+- `acquire`: first call pays index load (30–180s, set `timeout_secs`
+  past it); reports server RSS + system memory. TTL `300` for one
+  lookup, `1800` for active work; re-acquire extends.
+- `callers`: needs a live holding — "no holding" means acquire first.
+  Target: `path::to::fn` or `file.ext:line`; pass `lang` explicitly
+  (rust default, also python/go). Empty report is an answer, not an error.
+- `E01` (server missing) → `provision` the lang once, then acquire.
+- Each holding is a live server (~1.6 GB RSS for rust-analyzer);
+  don't hold workspaces you stopped using.
+```
