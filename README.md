@@ -165,14 +165,15 @@ Paste into your `AGENTS.md` when deepFunc is installed:
 ```markdown
 ## deepFunc (caller context)
 
-Reach for it when the question is about *callers*, not code: who
-calls this function, what breaks if I change its signature, is this
-dead code, how far does this call chain reach. It answers from the
-language server's call hierarchy — depth-1 caller bodies plus
-depth-2 signatures as one markdown doc — so it sees through
-indirection that grep misses, but only within one workspace and one
-language (rust, python, go). Not a search tool: for "where is X
-defined" or "what does Y do", read code instead.
+MANDATORY before modifying any function whose callers you do not
+already know: reach for deepFunc. It answers from the language
+server's call hierarchy — depth-1 caller bodies plus depth-2
+signatures as one markdown doc — so it sees through indirection
+that grep misses. It covers one workspace and one language per call
+(rust, python, go). It is NOT a search tool: for "where is X
+defined" or "what does Y do", read code instead. Typical triggers:
+who calls this, what breaks if this signature changes, is this dead
+code, how far does this chain reach.
 Lifecycle: `acquire` once per workspace, `callers` per question,
 `release` when done (holdings self-expire after TTL otherwise).
 - `acquire`: first call pays index load (30–180s, set `timeout_secs`
