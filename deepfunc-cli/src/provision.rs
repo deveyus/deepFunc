@@ -62,32 +62,6 @@ pub struct ProvisionReport {
     /// Runnable path for `--server-bin`: a binary or a wrapper script.
     pub program: String,
 }
-/// Default servers root: `$XDG_DATA_HOME/deepfunc/servers`, falling back
-/// to `~/.local/share/deepfunc/servers`, and on Windows to
-/// `%LOCALAPPDATA%/deepfunc/servers`.
-pub fn default_servers_dir() -> Result<PathBuf, Error> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("deepfunc/servers"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return Ok(PathBuf::from(home).join(".local/share/deepfunc/servers"));
-        }
-    }
-    #[cfg(windows)]
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        if !local.is_empty() {
-            return Ok(PathBuf::from(local).join("deepfunc/servers"));
-        }
-    }
-    Err(Error::Io {
-        path: "servers dir".to_owned(),
-        message: "cannot determine servers dir: set $XDG_DATA_HOME, $HOME (or %LOCALAPPDATA% on Windows), or pass --dir".to_owned(),
-    })
-}
-
 fn ensure_dir(path: &Path) -> Result<(), Error> {
     match std::fs::create_dir_all(path) {
         Ok(()) => Ok(()),
@@ -243,7 +217,7 @@ fn verify_sha1(bytes: &[u8], expected: &str, what: &str) -> Result<(), Error> {
 
 /// Unpack a .tar.gz archive into `dest`.
 fn unpack_tgz(bytes: &[u8], dest: &Path, what: &str) -> Result<(), Error> {
-    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     match archive.unpack(dest) {
         Ok(()) => Ok(()),
@@ -737,7 +711,7 @@ fn provision_rust(root: &Path, version: &str) -> Result<ProvisionReport, Error> 
                     })
                 }
             };
-            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+            let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
             let mut writer = std::io::BufWriter::new(file);
             if let Err(error) = std::io::copy(&mut decoder, &mut writer) {
                 return Err(Error::Io {
@@ -936,19 +910,6 @@ fn provision_go(root: &Path, version: &str, gopls_version: &str) -> Result<Provi
     })
 }
 
-/// Resolve a previously provisioned server: (program, table args stay
-/// with the caller). Returns None when no manifest exists. A corrupt
-/// manifest is ignored (fresh provision overwrites it).
-pub fn manifest_server(root: &Path, lang_id: &str) -> Option<(String, Vec<String>)> {
-    let text = std::fs::read_to_string(root.join(lang_id).join("manifest.json")).ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let program = manifest.get("program")?.as_str()?.to_owned();
-    if program.is_empty() || !Path::new(&program).is_file() {
-        return None;
-    }
-    Some((program, Vec::new()))
-}
-
 /// Provision one language server. `version_override` replaces the pinned
 /// default. `root` is the servers root (each language gets a subdir).
 /// macOS is refused outright: no signing cert, no Mac hardware to verify
@@ -993,7 +954,8 @@ pub fn provision(
 
 #[cfg(test)]
 mod tests {
-    use super::{manifest_server, npm_bin_entry, verify_sha1, verify_sha256};
+    use super::{npm_bin_entry, verify_sha1, verify_sha256};
+    use deepfunc_cli::manifest_server;
 
     #[test]
     fn sha_helpers_match_known_vectors() {

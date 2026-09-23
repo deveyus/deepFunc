@@ -323,6 +323,21 @@ impl LanguageClient {
         Ok(client)
     }
 
+    /// OS process id of the server child, for memory accounting.
+    /// None once the child was reaped (see `shutdown`).
+    pub fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
+    }
+
+    /// True while the server child is still running. A dead child means
+    /// the holding must be dropped and re-acquired, never reused.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     /// True once the server reports a complete index. Empty hierarchy
     /// results are only trustworthy when this holds.
     pub fn is_quiescent(&self) -> bool {

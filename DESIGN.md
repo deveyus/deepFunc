@@ -152,8 +152,6 @@ Solved, with evidence:
 
 Remaining:
 
-- Per-invocation server spawn pays full workspace load each run (~30s).
-  No daemon per operator decision.
 - Coverage gate (90% lines) applies to `deepfunc-core` only. Binaries are
   IO/LSP/network-bound: unit tests cover every pure function (arg
   parsing, path math, symbol-tree walk, archive roundtrips, error
@@ -161,3 +159,25 @@ Remaining:
   servers. Integration tests against fixture workspaces are the tracked
   follow-up; the full-workspace coverage report still prints for
   visibility on every gate run.
+
+## 2e. Holdings (acquire/release/callers)
+
+Per-call spawn cost (~30s load) stood until the daemon decision was
+revisited with data. Resolution: no new binary, no new protocol — the
+MCP server itself is persistent, so it keeps one live `LanguageClient`
+per `(workspace, lang)` across calls. The model manages lifecycle
+explicitly; the server enforces bounds:
+
+- `acquire(project, lang?, ttl_secs!, timeout_secs?)`: spawn (or reuse),
+  wait for index readiness, pin for TTL seconds after last use.
+  `ttl_secs` is REQUIRED (1800 suggested); re-acquire extends.
+  Reports server RSS plus system free/total so retention is informed.
+- `callers(...)`: serves ONLY from a live holding. No holding, lapsed
+  TTL, or dead server fails loudly telling the model to acquire —
+  never a silent cold-spawn (it cannot pick a TTL for you).
+- `release(project?, lang?)`: drop now (scope to all when omitted).
+- TTL expiry sweeps on every call; concurrent access serializes on one
+  mutex per holding (single-agent use). Dead children respawn only via
+  explicit re-acquire. Memory via `sysinfo` (RSS + total/available).
+- The CLI stays spawn-per-call (scripting discipline); holdings live
+  only in the MCP server process.

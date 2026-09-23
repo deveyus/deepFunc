@@ -11,6 +11,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+sysinfo = "0.32"
+deepfunc-cli = { path = "../deepfunc-cli" }
+deepfunc-core = { path = "../deepfunc-core" }
 
 [lints]
 workspace = true
