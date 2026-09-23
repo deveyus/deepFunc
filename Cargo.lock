@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "deepfunc-cli"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "deepfunc-core",
  "flate2",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "deepfunc-core"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "creusot-std",
  "iai-callgrind",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "deepfunc-mcp"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "deepfunc-cli",
  "deepfunc-core",

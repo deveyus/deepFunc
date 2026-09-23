@@ -1,9 +1,12 @@
 # deepFunc
 
-Give an LLM exactly the calling context it needs — no more, no less.
-deepFunc takes a function in a Rust, Python, or Go workspace, walks the
-language server's call hierarchy two levels up, and emits one markdown
-document: **full bodies at depth 1, signatures at depth 2.**
+Stop guessing who calls what. deepFunc gives an LLM exactly the
+calling context it needs — no more, no less: point it at a function
+in a Rust, Python, or Go workspace, and get back one markdown
+document with the **full bodies of its callers and the signatures of
+theirs**, walked straight from the language server's call hierarchy.
+Signature change? Dead code? Blast radius? Answered in one call,
+through indirection grep can't see.
 
 ```bash
 deepfunc --project ~/src/myapp --lang rust --target 'crate::net::dial'

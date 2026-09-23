@@ -3,7 +3,7 @@ resolver = "2"
 members = ["deepfunc-core", "deepfunc-cli", "deepfunc-mcp"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
 description = "Caller context for LLMs: depth-1 bodies, depth-2 signatures, via LSP call hierarchy"
