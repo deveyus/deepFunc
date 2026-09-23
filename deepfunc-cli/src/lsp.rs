@@ -158,9 +158,15 @@ fn read_message(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Str
     }
 }
 
-/// Indexing state from `rust-analyzer/serverStatus` notifications.
+/// Indexing state from `experimental/serverStatus` notifications.
 /// `quiescent: true` means the workspace index is complete and empty
 /// hierarchy results are trustworthy (not a cold-index race).
+/// The server only sends these when initialize declares the
+/// `serverStatusNotification` experimental capability (which we do) —
+/// without it `quiescent` stays false forever and every cold retry
+/// loop burns its full budget (measured on a fixture: 5s per empty
+/// answer). The legacy `rust-analyzer/serverStatus` name is accepted
+/// too, for older servers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServerStatus {
     seen: bool,
@@ -256,7 +262,9 @@ impl LanguageClient {
                     // keep a short diagnostic log for failure output.
                     if value.get("id").is_none() {
                         if let Some(method) = value.get("method").and_then(Value::as_str) {
-                            if method == "rust-analyzer/serverStatus" {
+                            if method == "experimental/serverStatus"
+                                || method == "rust-analyzer/serverStatus"
+                            {
                                 let quiescent = value
                                     .get("params")
                                     .and_then(|params| params.get("quiescent"))
@@ -321,7 +329,10 @@ impl LanguageClient {
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
-            "capabilities": {},
+            // Ask for experimental/serverStatus: without this flag RA
+            // never reports quiescence (verified by probe). Other
+            // servers ignore unknown capabilities.
+            "capabilities": {"experimental": {"serverStatusNotification": true}},
             "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
         });
         client.request("initialize", params)?;
