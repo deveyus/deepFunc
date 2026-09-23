@@ -184,7 +184,9 @@ Lifecycle: `acquire` once per workspace, `callers` per question,
   lookup, `1800` for active work; re-acquire extends.
 - `callers`: needs a live holding — "no holding" means acquire first.
   Target: `path::to::fn` or `file.ext:line`; pass `lang` explicitly
-  (rust default, also python/go). Empty report is an answer, not an error.
+  (rust default, also python/go). Warm calls skip the reload (a
+  multi-caller report measured ~25s warm on deepFunc's own tree vs
+  cold-load plus walk). Empty report is an answer, not an error.
 - `E01` (server missing) → `provision` the lang once, then acquire.
 - Each holding is a live server (~1.6 GB RSS for rust-analyzer);
   don't hold workspaces you stopped using.
