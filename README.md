@@ -154,12 +154,25 @@ fallbacks — a wrong answer is worse than none.
 | E07  | Filesystem failure with path context |
 | E08  | Language wired but known-broken |
 
+## Engineering
+
+Every commit passes the same gate, locally and in CI (pinned
+toolchain, locked deps): check, clippy with warnings denied, fmt,
+tests, release-mode tests, and coverage. The codebase carries
+`#![forbid(unsafe_code)]` in every crate, and workspace lints deny
+`unwrap`, `expect`, and `panic` — including tests — so failures
+surface as typed `E01`–`E08` errors, never crashes. `deepfunc-core`
+holds a 90% line-coverage bar; `DESIGN.md` records the LSP behaviors
+each release was verified against (canary readiness, null-as-empty,
+identifier-only positions). Nothing in the previous paragraph is a
+claim: `dev-scripts/gate.sh`, the lint table in the root `Cargo.toml`,
+and `DESIGN.md` are all in this repo.
+
 ## Development
 
 `DESIGN.md` is authoritative; `AGENTS.md` is the workflow guide.
-Three crates: `deepfunc-core` (pure logic), `deepfunc-cli` (LSP driver),
-`deepfunc-mcp` (rmcp stdio server). No panics, no unsafe, workspace lints
-deny both.
+Three crates: `deepfunc-core` (pure logic), `deepfunc-cli` (LSP driver
++ shared engine lib), `deepfunc-mcp` (rmcp stdio server with holdings).
 
 ## For agents
 
