@@ -52,7 +52,7 @@ fn log_ra_notifications_for_30s() {
         assert!(std::fs::write(dir.path().join("src/lib.rs"), lib).is_ok());
         let root_uri = format!("file://{}", dir.path().to_str().unwrap_or("/tmp"));
 
-        let mut child = Command::new("rust-analyzer")
+        let child = Command::new("rust-analyzer")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -60,7 +60,7 @@ fn log_ra_notifications_for_30s() {
             .ok();
         assert!(child.is_some(), "rust-analyzer not on PATH?");
         if let Some(mut child) = child {
-            let mut stdin = child.stdin.take();
+            let stdin = child.stdin.take();
             let stdout = child.stdout.take();
             assert!(stdin.is_some() && stdout.is_some(), "no pipes");
             if let (Some(mut stdin), Some(stdout)) = (stdin, stdout) {
