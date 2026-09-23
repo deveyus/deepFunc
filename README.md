@@ -38,8 +38,17 @@ C++ is not planned.
 
 ## Install
 
-No helpers required — no `go`, `npm`, or `curl` needed. deepFunc
-downloads everything itself, hash-verified:
+Prebuilt binaries ride each
+[GitHub release](https://github.com/deveyus/deepFunc/releases)
+(static Linux musl + Windows MSVC; macOS is unsupported — provision
+refuses darwin). Unpack, then provision the pinned language servers:
+
+```bash
+./deepfunc-cli provision --all
+```
+
+Or build from source. No helpers required — no `go`, `npm`, or
+`curl` needed. deepFunc downloads everything itself, hash-verified:
 
 ```bash
 cargo build --release -p deepfunc-cli

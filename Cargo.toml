@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
 description = "Caller context for LLMs: depth-1 bodies, depth-2 signatures, via LSP call hierarchy"
+repository = "https://github.com/deveyus/deepFunc"
+homepage = "https://github.com/deveyus/deepFunc"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

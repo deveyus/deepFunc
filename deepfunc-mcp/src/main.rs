@@ -659,17 +659,27 @@ mod tests {
 
     #[test]
     fn run_cli_reports_all_three_outcomes() {
-        // Success: stdout passes through (/bin/sh always exists, even on
-        // NixOS where /bin holds nothing else).
+        // Success: stdout passes through. Shell choice is per-platform:
+        // /bin/sh always exists on unix (even NixOS, where /bin holds
+        // nothing else); cmd.exe on Windows.
+        #[cfg(unix)]
         let ok = run_cli("/bin/sh", &["-c".to_owned(), "echo hi".to_owned()]);
+        #[cfg(windows)]
+        let ok = run_cli("cmd", &["/C".to_owned(), "echo hi".to_owned()]);
         assert!(ok.is_ok());
         if let Ok(text) = ok {
             assert!(text.contains("hi"));
         }
         // Tool error: non-zero exit surfaces stderr.
+        #[cfg(unix)]
         let failed = run_cli(
             "/bin/sh",
             &["-c".to_owned(), "echo oops >&2; exit 3".to_owned()],
+        );
+        #[cfg(windows)]
+        let failed = run_cli(
+            "cmd",
+            &["/C".to_owned(), "echo oops 1>&2 & exit 3".to_owned()],
         );
         assert!(matches!(failed, Err(CliOutcome::ToolError(_))));
         if let Err(CliOutcome::ToolError(message)) = failed {
